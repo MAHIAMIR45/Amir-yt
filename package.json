@@ -1,7 +1,7 @@
 {
   "name": "yt-downloader-api",
   "version": "1.0.0",
-  "description": "YouTube Video Downloader API",
+  "description": "YouTube Downloader API",
   "main": "index.js",
   "type": "commonjs",
   "scripts": {
