@@ -5,12 +5,7 @@ const cors = require('cors');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Middleware
-app.use(cors({
-  origin: '*',
-  methods: ['GET', 'OPTIONS']
-}));
-
+app.use(cors({ origin: '*', methods: ['GET', 'OPTIONS'] }));
 app.use(express.json());
 
 app.get('/', async (req, res) => {
@@ -20,8 +15,7 @@ app.get('/', async (req, res) => {
   if (!youtubeUrl) {
     return res.status(400).json({
       success: false,
-      error: "YouTube link required! Use: ?url=YOUR_YOUTUBE_LINK",
-      example: "?url=https://youtu.be/VIDEOID&quality=720p"
+      error: "YouTube link required! Use: ?url=YOUR_LINK&quality=720p"
     });
   }
 
@@ -40,52 +34,46 @@ app.get('/', async (req, res) => {
 
     const data = await apiResponse.json();
 
-    if (!data?.api?.mediaItems) {
+    if (!data?.api?.mediaItems?.length) {
       throw new Error('No media items found');
     }
 
     const videoFormats = [];
     const audioFormats = [];
 
+    // Improved Video ID extraction for Shorts + Normal videos
     let videoId = null;
     if (youtubeUrl.includes('youtu.be/')) {
       videoId = youtubeUrl.split('youtu.be/')[1]?.split('?')[0];
     } else if (youtubeUrl.includes('v=')) {
       videoId = youtubeUrl.split('v=')[1]?.split('&')[0];
+    } else if (youtubeUrl.includes('/shorts/')) {
+      videoId = youtubeUrl.split('/shorts/')[1]?.split('?')[0];
     }
 
-    // Process formats
+    // Process all formats
     for (const item of data.api.mediaItems) {
-      let quality = 'Unknown';
-      let resolution = null;
+      let quality = item.mediaQuality || 'Unknown';
+      let resolution = item.mediaRes;
 
-      if (item.mediaRes && item.mediaRes !== false) {
-        resolution = item.mediaRes;
-        if (item.mediaRes.includes('x')) {
-          const height = parseInt(item.mediaRes.split('x')[1]);
-          if (height === 1080) quality = '1080p';
-          else if (height === 720) quality = '720p';
-          else if (height === 480) quality = '480p';
-          else if (height === 360) quality = '360p';
-          else if (height === 240) quality = '240p';
-          else if (height === 144) quality = '144p';
-        }
-      }
-
-      if (item.type === 'Audio' && item.mediaQuality) {
-        quality = item.mediaQuality;   // Example: "128K", "48K"
+      if (resolution && resolution.includes('x')) {
+        const height = parseInt(resolution.split('x')[1]);
+        if (height === 1080) quality = '1080p';
+        else if (height === 720) quality = '720p';
+        else if (height === 480) quality = '480p';
+        else if (height === 360) quality = '360p';
+        else if (height === 240) quality = '240p';
+        else if (height === 144) quality = '144p';
       }
 
       let realDownloadUrl = null;
       let realFileSize = item.mediaFileSize;
 
+      // Poll for real link
       for (let attempt = 0; attempt < 5; attempt++) {
         try {
           const checkRes = await fetch(item.mediaUrl, {
-            headers: {
-              'User-Agent': 'Mozilla/5.0',
-              'Referer': 'https://app.ytdown.to/'
-            }
+            headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://app.ytdown.to/' }
           });
 
           const contentType = checkRes.headers.get('Content-Type') || '';
@@ -97,13 +85,13 @@ app.get('/', async (req, res) => {
               realFileSize = jsonData.fileSize || item.mediaFileSize;
               break;
             }
-            await new Promise(r => setTimeout(r, 2000));
+            await new Promise(r => setTimeout(r, 1500));
           } else {
             realDownloadUrl = item.mediaUrl;
             break;
           }
         } catch (e) {
-          await new Promise(r => setTimeout(r, 2000));
+          await new Promise(r => setTimeout(r, 1500));
         }
       }
 
@@ -112,12 +100,9 @@ app.get('/', async (req, res) => {
           quality: quality,
           extension: item.mediaExtension || (item.type === 'Audio' ? 'MP3' : 'MP4'),
           size: realFileSize || 'Unknown',
-          downloadUrl: realDownloadUrl
+          downloadUrl: realDownloadUrl,
+          type: item.type || 'Video'
         };
-
-        if (item.type !== 'Audio' && resolution) {
-          formatData.resolution = resolution;
-        }
 
         if (item.type === 'Audio') {
           audioFormats.push(formatData);
@@ -127,45 +112,38 @@ app.get('/', async (req, res) => {
       }
     }
 
-    // ==================== IMPROVED QUALITY MATCHING ====================
+    // ==================== STRONG QUALITY MATCHING (Fixed for Shorts) ====================
     let directDownload = null;
     if (requestedQuality) {
-      const q = requestedQuality.toLowerCase().trim().replace('p', '').replace('k', '');
+      const q = requestedQuality.toString().toLowerCase().trim()
+                    .replace('p', '').replace('k', '').replace('kbps', '');
 
       const allFormats = [...videoFormats, ...audioFormats];
 
+      // Multiple matching strategies
       const selected = allFormats.find(f => {
-        let fq = f.quality.toLowerCase();
-        fq = fq.replace('p', '').replace('k', '');
-        return fq === q || fq.includes(q);
+        let fq = f.quality.toString().toLowerCase()
+                     .replace('p', '').replace('k', '').replace('kbps', '');
+        return fq === q || 
+               fq.includes(q) || 
+               f.quality.toLowerCase().includes(requestedQuality.toLowerCase());
       });
 
       if (selected) {
         directDownload = selected.downloadUrl;
       }
     }
-    // =================================================================
-
-    // Video Info
-    let realTitle = data.api.title || "Unknown";
-    if (videoId) {
-      try {
-        const oembedRes = await fetch(`https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`);
-        const oembedData = await oembedRes.json();
-        realTitle = oembedData.title || realTitle;
-      } catch (e) {}
-    }
+    // =================================================================================
 
     const response = {
       success: true,
       developer: { name: "Deadly Dev" },
       video: {
-        title: realTitle,
-        thumbnail: `https://img.youtube.com/vi/${videoId}/maxresdefault.jpg`,
+        title: data.api.title || "Unknown",
+        thumbnail: videoId ? `https://img.youtube.com/vi/${videoId}/maxresdefault.jpg` : "",
         videoId: videoId,
         duration: "Unknown",
-        channel: "Unknown",
-        views: "Not available"
+        channel: "Unknown"
       },
       formats: {
         video: videoFormats,
@@ -173,7 +151,6 @@ app.get('/', async (req, res) => {
       }
     };
 
-    // Direct Download
     if (directDownload) {
       return res.redirect(directDownload);
     }
@@ -189,5 +166,5 @@ app.get('/', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`YouTube Downloader API running on port ${PORT}`);
+  console.log(`✅ YouTube Downloader API running on port ${PORT}`);
 });
