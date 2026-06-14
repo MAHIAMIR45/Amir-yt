@@ -15,7 +15,7 @@ app.use(express.json());
 
 app.get('/', async (req, res) => {
   const youtubeUrl = req.query.url;
-  const requestedQuality = req.query.quality; // Example: 720p, 1080p, 360p etc.
+  const requestedQuality = req.query.quality;
 
   if (!youtubeUrl) {
     return res.status(400).json({
@@ -26,7 +26,6 @@ app.get('/', async (req, res) => {
   }
 
   try {
-    // Step 1: Get media items from ytdown.to
     const apiResponse = await fetch('https://app.ytdown.to/proxy.php', {
       method: 'POST',
       headers: {
@@ -48,7 +47,6 @@ app.get('/', async (req, res) => {
     const videoFormats = [];
     const audioFormats = [];
 
-    // Extract Video ID
     let videoId = null;
     if (youtubeUrl.includes('youtu.be/')) {
       videoId = youtubeUrl.split('youtu.be/')[1]?.split('?')[0];
@@ -75,10 +73,9 @@ app.get('/', async (req, res) => {
       }
 
       if (item.type === 'Audio' && item.mediaQuality) {
-        quality = item.mediaQuality;
+        quality = item.mediaQuality;   // Example: "128K", "48K"
       }
 
-      // Get real direct download link
       let realDownloadUrl = null;
       let realFileSize = item.mediaFileSize;
 
@@ -130,29 +127,32 @@ app.get('/', async (req, res) => {
       }
     }
 
-    // Auto select if quality is requested
+    // ==================== IMPROVED QUALITY MATCHING ====================
     let directDownload = null;
     if (requestedQuality) {
-      const selected = [...videoFormats, ...audioFormats]
-        .find(f => f.quality.toLowerCase() === requestedQuality.toLowerCase());
-      
+      const q = requestedQuality.toLowerCase().trim().replace('p', '').replace('k', '');
+
+      const allFormats = [...videoFormats, ...audioFormats];
+
+      const selected = allFormats.find(f => {
+        let fq = f.quality.toLowerCase();
+        fq = fq.replace('p', '').replace('k', '');
+        return fq === q || fq.includes(q);
+      });
+
       if (selected) {
         directDownload = selected.downloadUrl;
       }
     }
+    // =================================================================
 
     // Video Info
     let realTitle = data.api.title || "Unknown";
-    let realDuration = null;
-    let realChannel = null;
-    let realViews = null;
-
     if (videoId) {
       try {
         const oembedRes = await fetch(`https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`);
         const oembedData = await oembedRes.json();
         realTitle = oembedData.title || realTitle;
-        realChannel = oembedData.author_name || null;
       } catch (e) {}
     }
 
@@ -163,9 +163,9 @@ app.get('/', async (req, res) => {
         title: realTitle,
         thumbnail: `https://img.youtube.com/vi/${videoId}/maxresdefault.jpg`,
         videoId: videoId,
-        duration: realDuration || "Unknown",
-        channel: realChannel || "Unknown",
-        views: realViews || "Not available"
+        duration: "Unknown",
+        channel: "Unknown",
+        views: "Not available"
       },
       formats: {
         video: videoFormats,
@@ -173,7 +173,7 @@ app.get('/', async (req, res) => {
       }
     };
 
-    // Agar quality diya gaya ho to direct redirect ya download
+    // Direct Download
     if (directDownload) {
       return res.redirect(directDownload);
     }
