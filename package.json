@@ -1,0 +1,15 @@
+{
+  "name": "yt-downloader-api",
+  "version": "1.0.0",
+  "description": "YouTube Video Downloader API",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "node-fetch": "^2.7.0",
+    "cors": "^2.8.5"
+  }
+}
