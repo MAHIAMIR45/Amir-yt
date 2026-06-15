@@ -59,7 +59,14 @@ def normalize_url(link):
 
 
 def get_ydl_opts():
-    """Build yt-dlp options for info extraction (no download)."""
+    """Build yt-dlp options for info extraction (no download).
+
+    ignore_no_formats_error=True is the critical setting: without a JS
+    runtime (Node/Deno), yt-dlp cannot solve YouTube's n-challenge cipher
+    and its default format-selector raises 'Requested format is not
+    available'.  This flag suppresses that exception so we still receive
+    info['formats'] and can do our own quality selection.
+    """
     opts = {
         "quiet":                      True,
         "no_warnings":                True,
@@ -69,8 +76,10 @@ def get_ydl_opts():
         "fragment_retries":           5,
         "skip_unavailable_fragments": True,
         "http_headers":               {"User-Agent": _USER_AGENT},
-        # Bypass geographic restrictions (Render servers are US-based;
-        # many Bollywood/regional videos are geo-blocked there)
+        # Suppress the ExtractorError when format-selector finds nothing —
+        # we do our own selection from info['formats'] anyway.
+        "ignore_no_formats_error":    True,
+        # Geo-bypass helps with regionally restricted content
         "geo_bypass":                 True,
         "geo_bypass_country":         "PK",
     }
