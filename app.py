@@ -69,6 +69,10 @@ def get_ydl_opts():
         "fragment_retries":           5,
         "skip_unavailable_fragments": True,
         "http_headers":               {"User-Agent": _USER_AGENT},
+        # Bypass geographic restrictions (Render servers are US-based;
+        # many Bollywood/regional videos are geo-blocked there)
+        "geo_bypass":                 True,
+        "geo_bypass_country":         "PK",
     }
     if os.path.isfile(_COOKIE_FILE):
         opts["cookiefile"] = _COOKIE_FILE
