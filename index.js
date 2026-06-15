@@ -6,99 +6,162 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(cors({ origin: '*', methods: ['GET', 'OPTIONS'] }));
-
-const BACKEND = "https://yt-amir.onrender.com";
+app.use(express.json());
 
 app.get('/', async (req, res) => {
-  let youtubeUrl = req.query.url;
-  const quality = req.query.quality;   // 1080, 720, 360, 128 etc.
+  const youtubeUrl = req.query.url;
+  const requestedQuality = req.query.quality;
 
   if (!youtubeUrl) {
     return res.status(400).json({
       success: false,
-      error: "URL missing! Example: ?url=https://youtube.com/shorts/VIDEO&quality=720"
+      error: "YouTube link required! Use: ?url=YOUR_LINK&quality=360p"
     });
   }
 
   try {
-    youtubeUrl = youtubeUrl.trim();
-    if (!youtubeUrl.startsWith('http')) {
-      youtubeUrl = 'https://' + youtubeUrl;
-    }
-
-    let apiUrl = `\( {BACKEND}/download/video?url= \){encodeURIComponent(youtubeUrl)}`;
-
-    const response = await fetch(apiUrl, {
-      headers: { 'User-Agent': 'Mozilla/5.0' }
+    const apiResponse = await fetch('https://app.ytdown.to/proxy.php', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'X-Requested-With': 'XMLHttpRequest',
+        'Referer': 'https://app.ytdown.to/en34/',
+        'Origin': 'https://app.ytdown.to'
+      },
+      body: new URLSearchParams({ url: youtubeUrl })
     });
 
-    const contentType = response.headers.get('content-type') || '';
+    const data = await apiResponse.json();
 
-    // Agar direct file aa raha hai
-    if (contentType.includes('video') || contentType.includes('audio')) {
-      const filename = `video${quality ? '_' + quality : ''}.mp4`;
-      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-      return response.body.pipe(res);
+    if (!data?.api?.mediaItems?.length) {
+      throw new Error('No media items found');
     }
 
-    const data = await response.json();
+    const videoFormats = [];
+    const audioFormats = [];
 
-    if (data.status === "error") {
-      return res.status(400).json({ success: false, error: data.error });
+    // Video ID Extraction (Shorts + Normal + youtu.be)
+    let videoId = null;
+    if (youtubeUrl.includes('youtu.be/')) {
+      videoId = youtubeUrl.split('youtu.be/')[1]?.split('?')[0];
+    } else if (youtubeUrl.includes('/shorts/')) {
+      videoId = youtubeUrl.split('/shorts/')[1]?.split('?')[0];
+    } else if (youtubeUrl.includes('v=')) {
+      videoId = youtubeUrl.split('v=')[1]?.split('&')[0];
     }
 
-    // ==================== QUALITY MATCHING ====================
-    let directUrl = null;
+    for (const item of data.api.mediaItems) {
+      let quality = item.mediaQuality || item.mediaRes || 'Unknown';
+      let resolution = item.mediaRes;
 
-    if (quality) {
-      const q = quality.toString().toLowerCase().replace('p', '').replace('k', '').trim();
-      const qNum = parseInt(q);
-
-      // Combined Video + Audio
-      if (data.formats?.combined?.length) {
-        directUrl = data.formats.combined.find(f => 
-          f.height == qNum || 
-          f.resolution?.includes(q) ||
-          f.format_note?.includes(q)
-        )?.url;
+      // Convert resolution to standard quality
+      if (resolution && resolution.includes('x')) {
+        const height = parseInt(resolution.split('x')[1]);
+        if (height >= 1080) quality = '1080p';
+        else if (height >= 720) quality = '720p';
+        else if (height >= 480) quality = '480p';
+        else if (height >= 360) quality = '360p';
+        else if (height >= 240) quality = '240p';
+        else if (height >= 144) quality = '144p';
       }
 
-      // Agar audio quality chahiye
-      if (!directUrl && (qNum === 128 || qNum === 251 || q === 'audio')) {
-        if (data.formats?.audio_only?.length) {
-          directUrl = data.formats.audio_only[0]?.url;   // best audio
+      let realDownloadUrl = null;
+      let realFileSize = item.mediaFileSize;
+
+      for (let attempt = 0; attempt < 6; attempt++) {
+        try {
+          const checkRes = await fetch(item.mediaUrl, {
+            headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://app.ytdown.to/' }
+          });
+
+          const contentType = checkRes.headers.get('Content-Type') || '';
+
+          if (contentType.includes('application/json')) {
+            const jsonData = await checkRes.json();
+            if (jsonData.status === 'completed' && jsonData.fileUrl) {
+              realDownloadUrl = jsonData.fileUrl;
+              realFileSize = jsonData.fileSize || item.mediaFileSize;
+              break;
+            }
+            await new Promise(r => setTimeout(r, 1200));
+          } else {
+            realDownloadUrl = item.mediaUrl;
+            break;
+          }
+        } catch (e) {
+          await new Promise(r => setTimeout(r, 1200));
+        }
+      }
+
+      if (realDownloadUrl) {
+        const formatData = {
+          quality: quality,
+          extension: item.mediaExtension || (item.type === 'Audio' ? 'MP3' : 'MP4'),
+          size: realFileSize || 'Unknown',
+          downloadUrl: realDownloadUrl
+        };
+
+        if (item.type === 'Audio') {
+          audioFormats.push(formatData);
+        } else {
+          videoFormats.push(formatData);
         }
       }
     }
 
-    // Direct Redirect (Best Case)
-    if (directUrl) {
-      return res.redirect(directUrl);
-    }
+    // ==================== VERY STRONG QUALITY MATCHING ====================
+    let directDownload = null;
+    if (requestedQuality) {
+      const q = requestedQuality.toString().toLowerCase().trim();
 
-    // Return Full Data
-    res.json({
+      const allFormats = [...videoFormats, ...audioFormats];
+
+      const selected = allFormats.find(f => {
+        const fq = f.quality.toString().toLowerCase();
+        return fq.includes(q) || 
+               fq.replace('p','').replace('k','') === q.replace('p','').replace('k','') ||
+               (q === '360' && fq.includes('360')) ||
+               (q === '480' && fq.includes('480')) ||
+               (q === '720' && fq.includes('720')) ||
+               (q === '1080' && fq.includes('1080'));
+      });
+
+      if (selected) {
+        directDownload = selected.downloadUrl;
+      }
+    }
+    // =================================================================
+
+    const response = {
       success: true,
       developer: { name: "Deadly Dev" },
       video: {
-        title: data.title,
-        thumbnail: data.thumbnail,
-        duration: data.duration,
-        channel: data.channel
+        title: data.api.title || "Unknown",
+        thumbnail: videoId ? `https://img.youtube.com/vi/${videoId}/maxresdefault.jpg` : "",
+        videoId: videoId
       },
-      formats: data.formats || {},
-      note: "Use &quality=1080, 720, 480, 360, 128 for direct download"
-    });
+      formats: {
+        video: videoFormats,
+        audio: audioFormats
+      }
+    };
+
+    // Direct Redirect if quality requested
+    if (directDownload) {
+      return res.redirect(directDownload);
+    }
+
+    res.json(response);
 
   } catch (err) {
     res.status(500).json({
       success: false,
-      error: "Failed to process request",
-      message: err.message
+      error: err.message || "Failed to process video"
     });
   }
 });
 
 app.listen(PORT, () => {
-  console.log(`✅ API Running Successfully on port ${PORT}`);
+  console.log(`✅ API running on port ${PORT}`);
 });
