@@ -10,24 +10,24 @@ app.use(cors({ origin: '*', methods: ['GET', 'OPTIONS'] }));
 const BACKEND = "https://yt-amir.onrender.com";
 
 app.get('/', async (req, res) => {
-  const youtubeUrl = req.query.url;
-  let quality = req.query.quality;   // e.g. 720p, 1080p, 360p, 128 etc.
+  let youtubeUrl = req.query.url;
+  const quality = req.query.quality;   // 720p, 1080p, 360p, etc.
 
   if (!youtubeUrl) {
     return res.status(400).json({
       success: false,
-      error: "YouTube link required → ?url=YOUTUBE_LINK&quality=720p"
+      error: "YouTube link required! Example: ?url=https://youtu.be/VIDEOID&quality=720p"
     });
   }
 
   try {
-    let apiUrl = `\( {BACKEND}/download/video?url= \){encodeURIComponent(youtubeUrl)}`;
-
-    // Agar quality di gayi hai to direct merged video maango
-    if (quality) {
-      const height = quality.toLowerCase().replace('p', '').replace('k', '');
-      apiUrl += `&height=${height}`;
+    // Clean URL
+    youtubeUrl = youtubeUrl.trim();
+    if (!youtubeUrl.startsWith('http')) {
+      youtubeUrl = 'https://' + youtubeUrl;
     }
+
+    let apiUrl = `\( {BACKEND}/download/video?url= \){encodeURIComponent(youtubeUrl)}`;
 
     const response = await fetch(apiUrl, {
       headers: {
@@ -37,25 +37,34 @@ app.get('/', async (req, res) => {
 
     const contentType = response.headers.get('content-type') || '';
 
-    // Agar direct video file aa raha hai (merged)
+    // Direct Video/Audio File (Download)
     if (contentType.includes('video') || contentType.includes('audio')) {
-      res.setHeader('Content-Disposition', `attachment; filename="video.mp4"`);
+      const filename = quality ? `video_${quality}.mp4` : "video.mp4";
+      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
       return response.body.pipe(res);
     }
 
-    // Agar JSON aa raha hai (formats list)
+    // JSON Response
     const data = await response.json();
 
-    // Quality matching agar direct nahi mila
+    if (data.status === "error") {
+      throw new Error(data.error || "Backend error");
+    }
+
+    // Quality-based Direct Download
     if (quality && data.formats?.combined) {
-      const q = parseInt(quality);
-      const match = data.formats.combined.find(f => f.height === q);
+      const q = parseInt(quality.replace('p', '').replace('k', ''));
+      const match = data.formats.combined.find(f => 
+        f.height === q || 
+        f.resolution?.includes(q.toString())
+      );
+      
       if (match && match.url) {
         return res.redirect(match.url);
       }
     }
 
-    // Return full info
+    // Return Full Data
     res.json({
       success: true,
       developer: { name: "Deadly Dev" },
@@ -66,7 +75,7 @@ app.get('/', async (req, res) => {
         channel: data.channel
       },
       formats: data.formats || {},
-      note: "Use &quality=720p, 1080p, 480p, 360p etc. for direct download"
+      note: "Direct download: &quality=1080p, 720p, 480p, 360p, 128 etc."
     });
 
   } catch (err) {
@@ -79,5 +88,5 @@ app.get('/', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 API Running on port ${PORT} | Backend: ${BACKEND}`);
+  console.log(`✅ API Running on port ${PORT}`);
 });
