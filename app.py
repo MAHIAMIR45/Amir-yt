@@ -59,34 +59,17 @@ def normalize_url(link):
 
 
 def get_ydl_opts():
-    """Build yt-dlp options that work reliably on server IPs.
-
-    Uses mweb (mobile web) player client which is less restricted on
-    datacenter / server IP addresses than the default web client.
-    Also uses yt-dlp-ejs for the JS challenge solver when Node.js is available.
-    """
-    import shutil
-    node_path = shutil.which("node") or "node"
-
+    """Build yt-dlp options for info extraction (no download)."""
     opts = {
-        "quiet":             True,
-        "no_warnings":       True,
-        "skip_download":     True,
-        "noplaylist":        True,
-        "retries":           5,
-        "fragment_retries":  5,
+        "quiet":                      True,
+        "no_warnings":                True,
+        "skip_download":              True,
+        "noplaylist":                 True,
+        "retries":                    5,
+        "fragment_retries":           5,
         "skip_unavailable_fragments": True,
-        "http_headers":      {"User-Agent": _USER_AGENT},
-        "extractor_args":    {
-            "youtube": {
-                "player_client": ["mweb", "web"],
-            }
-        },
+        "http_headers":               {"User-Agent": _USER_AGENT},
     }
-    # Add Node.js runtime if available (for JS challenge solver)
-    if shutil.which("node"):
-        opts["js_runtimes"] = {"node": {"path": node_path}}
-
     if os.path.isfile(_COOKIE_FILE):
         opts["cookiefile"] = _COOKIE_FILE
     return opts
