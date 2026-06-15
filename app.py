@@ -61,27 +61,21 @@ def normalize_url(link):
 def get_ydl_opts():
     """Build yt-dlp options for info extraction (no download).
 
-    ignore_no_formats_error=True is the critical setting: without a JS
-    runtime (Node/Deno), yt-dlp cannot solve YouTube's n-challenge cipher
-    and its default format-selector raises 'Requested format is not
-    available'.  This flag suppresses that exception so we still receive
-    info['formats'] and can do our own quality selection.
+    process=False in extract_info() is the critical fix: it bypasses
+    yt-dlp's internal format-selector entirely, so we always get the raw
+    info['formats'] list from YouTube's API regardless of JS runtime
+    availability or server IP restrictions.  We do our own quality
+    selection from that list.
     """
     opts = {
-        "quiet":                      True,
-        "no_warnings":                True,
-        "skip_download":              True,
-        "noplaylist":                 True,
-        "retries":                    5,
-        "fragment_retries":           5,
-        "skip_unavailable_fragments": True,
-        "http_headers":               {"User-Agent": _USER_AGENT},
-        # Suppress the ExtractorError when format-selector finds nothing —
-        # we do our own selection from info['formats'] anyway.
-        "ignore_no_formats_error":    True,
+        "quiet":        True,
+        "no_warnings":  True,
+        "noplaylist":   True,
+        "retries":      5,
         # Geo-bypass helps with regionally restricted content
-        "geo_bypass":                 True,
-        "geo_bypass_country":         "PK",
+        "geo_bypass":              True,
+        "geo_bypass_country":      "PK",
+        "http_headers": {"User-Agent": _USER_AGENT},
     }
     if os.path.isfile(_COOKIE_FILE):
         opts["cookiefile"] = _COOKIE_FILE
@@ -89,8 +83,15 @@ def get_ydl_opts():
 
 
 def extract_info(url):
+    """Extract video info without triggering yt-dlp's format selector.
+
+    Using process=False returns the raw YouTube API response with the
+    complete formats list.  This avoids the 'Requested format is not
+    available' error that yt-dlp raises on server IPs when it cannot
+    solve the n-challenge cipher (no Node.js / JS runtime available).
+    """
     with yt_dlp.YoutubeDL(get_ydl_opts()) as ydl:
-        return ydl.extract_info(url, download=False)
+        return ydl.extract_info(url, download=False, process=False)
 
 
 def format_duration(seconds):
