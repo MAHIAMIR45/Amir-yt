@@ -1,15 +1,14 @@
 {
-  "name": "yt-downloader-api",
+  "name": "youtube-downloader-api",
   "version": "1.0.0",
-  "description": "YouTube Downloader API",
   "main": "index.js",
-  "type": "commonjs",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "express": "^4.19.2",
-    "node-fetch": "^2.7.0",
-    "cors": "^2.8.5"
+    "@distube/ytdl-core": "^4.16.12",
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
+    "node-fetch": "^2.7.0"
   }
 }
