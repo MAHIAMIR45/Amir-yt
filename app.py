@@ -1,0 +1,386 @@
+import os
+import re
+import urllib.request
+import yt_dlp
+from flask import Flask, request, jsonify, render_template, Response, stream_with_context
+from flask_cors import CORS
+
+app = Flask(__name__)
+CORS(app)
+
+# ── Cookies file (Netscape format) ──
+# Sits in the project root. yt-dlp uses it for both the watch page and the
+# player API requests so the server isn't bot-detected on Render.
+_COOKIE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
+
+# ── Modern Chrome User-Agent ──
+_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
+
+
+def normalize_url(link):
+    """Fix https:/ → https:// (double slash stripped by URL routing)."""
+    link = link.strip()
+    if link.startswith("https:/") and not link.startswith("https://"):
+        link = "https://" + link[7:]
+    elif link.startswith("http:/") and not link.startswith("http://"):
+        link = "http://" + link[6:]
+    elif not link.startswith("http"):
+        link = "https://" + link
+    return link
+
+
+def get_ydl_opts():
+    """Build yt-dlp options that work reliably on server IPs.
+
+    Requires the yt-dlp-ejs Python package (pip install yt-dlp-ejs) and
+    Node.js to be available.  yt-dlp-ejs provides the EJS challenge solver
+    that decrypts YouTube's n-challenge and signature, which is necessary
+    to get actual video/audio URLs from server IPs.
+    """
+    import shutil
+    node_path = shutil.which("node") or "node"
+
+    opts = {
+        "quiet":             True,
+        "no_warnings":       True,
+        "skip_download":     True,
+        "noplaylist":        True,
+        "retries":           5,
+        "fragment_retries":  5,
+        "skip_unavailable_fragments": True,
+        "http_headers":      {"User-Agent": _USER_AGENT},
+        "js_runtimes":       {"node": {"path": node_path}},
+    }
+    if os.path.isfile(_COOKIE_FILE):
+        opts["cookiefile"] = _COOKIE_FILE
+    return opts
+
+
+def extract_info(url):
+    with yt_dlp.YoutubeDL(get_ydl_opts()) as ydl:
+        return ydl.extract_info(url, download=False)
+
+
+def format_duration(seconds):
+    if not seconds:
+        return "N/A"
+    seconds = int(seconds)
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    if h:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
+
+
+def format_filesize(size):
+    if not size:
+        return None
+    if size < 1024 * 1024:
+        return f"{size / 1024:.1f} KB"
+    elif size < 1024 * 1024 * 1024:
+        return f"{size / (1024 * 1024):.1f} MB"
+    else:
+        return f"{size / (1024 * 1024 * 1024):.2f} GB"
+
+
+def build_format_entry(fmt):
+    vcodec   = fmt.get("vcodec") or "none"
+    acodec   = fmt.get("acodec") or "none"
+    has_video = vcodec not in (None, "none")
+    has_audio = acodec not in (None, "none")
+    height   = fmt.get("height")
+    width    = fmt.get("width")
+    size     = fmt.get("filesize") or fmt.get("filesize_approx")
+    return {
+        "format_id":      fmt.get("format_id"),
+        "ext":            fmt.get("ext"),
+        "resolution":     fmt.get("resolution") or (
+                          f"{width}x{height}" if width and height else "audio only"),
+        "height":         height,
+        "width":          width,
+        "fps":            fmt.get("fps"),
+        "vcodec":         vcodec,
+        "acodec":         acodec,
+        "abr":            fmt.get("abr") or 0,
+        "vbr":            fmt.get("vbr"),
+        "tbr":            fmt.get("tbr"),
+        "filesize":       size,
+        "filesize_human": format_filesize(size),
+        "format_note":    fmt.get("format_note") or "",
+        "has_video":      has_video,
+        "has_audio":      has_audio,
+        "url":            fmt.get("url"),
+    }
+
+
+def parse_formats(info):
+    combined   = []
+    video_only = []
+    audio_only = []
+    seen       = set()
+    for fmt in info.get("formats", []):
+        if not fmt.get("url"):
+            continue
+        fid = fmt.get("format_id")
+        if fid in seen:
+            continue
+        seen.add(fid)
+        entry     = build_format_entry(fmt)
+        has_video = entry["has_video"]
+        has_audio = entry["has_audio"]
+        if has_video and has_audio:
+            combined.append(entry)
+        elif has_video:
+            video_only.append(entry)
+        elif has_audio:
+            audio_only.append(entry)
+
+    combined.sort(key=lambda x: x.get("height") or 0, reverse=True)
+    video_only.sort(key=lambda x: x.get("height") or 0, reverse=True)
+    audio_only.sort(key=lambda x: x.get("abr") or 0, reverse=True)
+    return combined, video_only, audio_only
+
+
+# ══════════════════════════════════════════════════════
+#  ROUTES
+# ══════════════════════════════════════════════════════
+
+def _is_direct_url(url):
+    """True when the URL is a direct byte-stream (videoplayback), not an HLS/DASH manifest."""
+    if not url:
+        return False
+    return "videoplayback" in url and "manifest" not in url
+
+
+def _safe_filename(title, ext):
+    safe = re.sub(r'[^\w\s\-]', '', title or "video")
+    safe = re.sub(r'\s+', '_', safe.strip())[:80]
+    return f"{safe}.{ext}"
+
+
+def _find_format_by_quality(quality, combined, video_only, audio_only):
+    """Return (stream_url, ext, content_type) for a given quality string.
+
+    Video qualities : '1080p', '720p', '480p', '360p', '240p', '144p'
+    Audio qualities : '128', '48'  (kbps as a plain integer string)
+
+    Only direct videoplayback URLs are returned — HLS/manifest URLs are
+    skipped so the proxy can stream raw bytes to the client.
+    """
+    q = quality.strip().lower()
+
+    # ── Audio ───────────────────────────────────────────────────
+    if q.isdigit():
+        target_abr = int(q)
+        candidates = [f for f in audio_only if _is_direct_url(f.get("url"))]
+        best = min(candidates, key=lambda f: abs((f.get("abr") or 0) - target_abr), default=None)
+        if best:
+            ext = best.get("ext", "m4a")
+            ct  = "audio/mp4" if ext == "m4a" else "audio/webm"
+            return best["url"], ext, ct
+        return None, None, None
+
+    # ── Video ───────────────────────────────────────────────────
+    if q.endswith("p") and q[:-1].isdigit():
+        target_h = int(q[:-1])
+
+        # Prefer direct combined (video + audio in one file) — exact then closest
+        direct_combined = [f for f in combined if _is_direct_url(f.get("url"))]
+        for fmt in direct_combined:
+            if fmt.get("height") == target_h:
+                ext = fmt.get("ext", "mp4")
+                return fmt["url"], ext, "video/mp4"
+        for fmt in direct_combined:
+            if (fmt.get("height") or 0) <= target_h:
+                ext = fmt.get("ext", "mp4")
+                return fmt["url"], ext, "video/mp4"
+
+        # Fall back to direct video-only — exact then closest
+        direct_video = [f for f in video_only if _is_direct_url(f.get("url"))]
+        for fmt in direct_video:
+            if fmt.get("height") == target_h:
+                ext = fmt.get("ext", "mp4")
+                return fmt["url"], ext, "video/mp4"
+        for fmt in direct_video:
+            if (fmt.get("height") or 0) <= target_h:
+                ext = fmt.get("ext", "mp4")
+                return fmt["url"], ext, "video/mp4"
+
+    return None, None, None
+
+
+def _proxy_stream(stream_url, filename, content_type):
+    """Stream bytes from stream_url through Flask with a download header.
+
+    Forwards Range requests so Android DownloadManager can resume/seek.
+    Passes Content-Length through so the client can show progress.
+    """
+    req_headers = {
+        "User-Agent": _USER_AGENT,
+        "Referer":    "https://www.youtube.com/",
+    }
+    range_hdr = request.headers.get("Range")
+    if range_hdr:
+        req_headers["Range"] = range_hdr
+
+    req = urllib.request.Request(stream_url, headers=req_headers)
+    try:
+        upstream = urllib.request.urlopen(req, timeout=30)
+    except urllib.error.HTTPError as e:
+        return jsonify({"error": f"Upstream error {e.code}"}), 502
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    status       = upstream.status
+    content_len  = upstream.headers.get("Content-Length")
+    accept_ranges = upstream.headers.get("Accept-Ranges", "bytes")
+
+    resp_headers = {
+        "Content-Disposition": f'attachment; filename="{filename}"',
+        "Accept-Ranges":       accept_ranges,
+    }
+    if content_len:
+        resp_headers["Content-Length"] = content_len
+
+    def generate():
+        try:
+            while True:
+                chunk = upstream.read(65536)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            upstream.close()
+
+    return Response(
+        stream_with_context(generate()),
+        status=status,
+        content_type=content_type,
+        headers=resp_headers,
+    )
+
+
+@app.route("/")
+def index():
+    raw_url = request.args.get("url", "").strip()
+    quality  = request.args.get("quality", "").strip()
+
+    if raw_url and quality:
+        url = normalize_url(raw_url)
+        try:
+            info = extract_info(url)
+            combined, video_only, audio_only = parse_formats(info)
+            stream_url, ext, content_type = _find_format_by_quality(
+                quality, combined, video_only, audio_only)
+            if stream_url:
+                title    = info.get("title", "video")
+                filename = _safe_filename(title, ext)
+                return _proxy_stream(stream_url, filename, content_type)
+            return jsonify({"error": f"Quality '{quality}' not available"}), 404
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
+    return render_template("index.html")
+
+
+@app.route("/search")
+def search():
+    query = request.args.get("q", "").strip()
+    limit = int(request.args.get("limit", 12))
+    if not query:
+        return jsonify({"error": "Query is required"}), 400
+    try:
+        opts = get_ydl_opts()
+        opts["extract_flat"] = True
+        opts["playlistend"]  = limit
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
+        videos = []
+        for entry in info.get("entries", []):
+            if not entry:
+                continue
+            vid_id     = entry.get("id", "")
+            thumbnails = entry.get("thumbnails") or []
+            thumb = (thumbnails[-1]["url"] if thumbnails
+                     else f"https://i.ytimg.com/vi/{vid_id}/hqdefault.jpg")
+            videos.append({
+                "id":        vid_id,
+                "title":     entry.get("title", ""),
+                "thumbnail": thumb,
+                "duration":  format_duration(entry.get("duration")),
+                "channel":   entry.get("channel") or entry.get("uploader") or "",
+                "views":     entry.get("view_count"),
+                "url":       entry.get("url") or f"https://www.youtube.com/watch?v={vid_id}",
+            })
+        return jsonify({"results": videos})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ── /download/audio?url=<youtube_url>
+#    Returns JSON: best_audio + all_audio_formats with direct download URLs
+@app.route("/download/audio")
+@app.route("/download/audio/<path:link>")
+def download_audio(link=None):
+    raw = request.args.get("url") or link or ""
+    if not raw:
+        return jsonify({"status": "error", "error": "url parameter required"}), 400
+    url = normalize_url(raw)
+    try:
+        info = extract_info(url)
+        _, _, audio_only = parse_formats(info)
+        best = audio_only[0] if audio_only else None
+
+        return jsonify({
+            "status":            "ok",
+            "title":             info.get("title"),
+            "thumbnail":         info.get("thumbnail"),
+            "duration":          format_duration(info.get("duration")),
+            "channel":           info.get("uploader"),
+            "best_audio":        best,
+            "all_audio_formats": audio_only,
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 500
+
+
+# ── /download/video?url=<youtube_url>
+#    Returns JSON: all formats (combined / video_only / audio_only) with direct download URLs
+@app.route("/download/video")
+@app.route("/download/video/<path:link>")
+def download_video(link=None):
+    raw = request.args.get("url") or link or ""
+    if not raw:
+        return jsonify({"status": "error", "error": "url parameter required"}), 400
+    url = normalize_url(raw)
+    try:
+        info = extract_info(url)
+        combined, video_only, audio_only = parse_formats(info)
+
+        return jsonify({
+            "status":         "ok",
+            "title":          info.get("title"),
+            "thumbnail":      info.get("thumbnail"),
+            "duration":       format_duration(info.get("duration")),
+            "channel":        info.get("uploader"),
+            "description":    (info.get("description") or "")[:300],
+            "formats": {
+                "combined":   combined,
+                "video_only": video_only,
+                "audio_only": audio_only,
+            },
+            "formats_flat":   combined + video_only + audio_only,
+            "formats_count":  len(combined) + len(video_only) + len(audio_only),
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 500
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)
