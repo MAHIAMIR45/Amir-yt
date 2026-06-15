@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: yt-downloader-api
+    runtime: node
+    buildCommand: apt-get install -y ffmpeg && npm install
+    startCommand: node index.js
+    envVars:
+      - key: PORT
+        value: 10000
