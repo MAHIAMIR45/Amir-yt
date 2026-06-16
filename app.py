@@ -152,8 +152,56 @@ _FFMPEG_HEADERS = (
 )
 
 
+def _run_ffmpeg_to_tempfile(cmd, suffix):
+    """Run ffmpeg writing to a temp file; return (path, size_bytes) or raise on failure."""
+    import tempfile
+    tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+    tmp.close()
+    full_cmd = cmd + [tmp.name]
+    result = subprocess.run(full_cmd, capture_output=True)
+    if result.returncode != 0:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+        raise RuntimeError(result.stderr.decode("utf-8", errors="replace")[:400])
+    size = os.path.getsize(tmp.name)
+    if size == 0:
+        os.unlink(tmp.name)
+        raise RuntimeError("ffmpeg produced empty output")
+    return tmp.name, size
+
+
+def _serve_tempfile(path, size, content_type, filename, delete_after=True):
+    """Stream a temp file to the client with Content-Length, then delete it."""
+    def generate():
+        try:
+            with open(path, "rb") as f:
+                while True:
+                    chunk = f.read(65536)
+                    if not chunk:
+                        break
+                    yield chunk
+        finally:
+            if delete_after:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+
+    return Response(
+        stream_with_context(generate()),
+        content_type=content_type,
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Length":      str(size),
+            "Accept-Ranges":       "bytes",
+        },
+    )
+
+
 def _ffmpeg_merge_video_audio(video_url, audio_url, filename):
-    """Merge separate video + audio streams using ffmpeg and stream MP4 to client."""
+    """Merge separate video + audio streams → temp MP4 → serve with Content-Length."""
     cmd = [
         "ffmpeg", "-y",
         "-loglevel", "error",
@@ -164,66 +212,30 @@ def _ffmpeg_merge_video_audio(video_url, audio_url, filename):
         "-c:v", "copy",
         "-c:a", "aac",
         "-b:a", "128k",
-        "-movflags", "frag_keyframe+empty_moov+faststart",
+        "-movflags", "faststart",
         "-f", "mp4",
-        "pipe:1",
     ]
-
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-
-    def generate():
-        try:
-            while True:
-                chunk = proc.stdout.read(65536)
-                if not chunk:
-                    break
-                yield chunk
-        finally:
-            proc.stdout.close()
-            proc.wait()
-
-    return Response(
-        stream_with_context(generate()),
-        content_type="video/mp4",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-    )
+    path, size = _run_ffmpeg_to_tempfile(cmd, ".mp4")
+    return _serve_tempfile(path, size, "video/mp4", filename)
 
 
 def _ffmpeg_combined_video(video_url, filename):
-    """Re-mux a combined (video+audio) stream through ffmpeg for reliable delivery."""
+    """Re-mux a combined stream → temp MP4 → serve with Content-Length."""
     cmd = [
         "ffmpeg", "-y",
         "-loglevel", "error",
         "-headers", _FFMPEG_HEADERS,
         "-i", video_url,
         "-c", "copy",
-        "-movflags", "frag_keyframe+empty_moov+faststart",
+        "-movflags", "faststart",
         "-f", "mp4",
-        "pipe:1",
     ]
-
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-
-    def generate():
-        try:
-            while True:
-                chunk = proc.stdout.read(65536)
-                if not chunk:
-                    break
-                yield chunk
-        finally:
-            proc.stdout.close()
-            proc.wait()
-
-    return Response(
-        stream_with_context(generate()),
-        content_type="video/mp4",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-    )
+    path, size = _run_ffmpeg_to_tempfile(cmd, ".mp4")
+    return _serve_tempfile(path, size, "video/mp4", filename)
 
 
 def _ffmpeg_audio_mp3(audio_url, filename):
-    """Convert audio stream to MP3 using ffmpeg and stream to client."""
+    """Convert audio → temp MP3 → serve with Content-Length."""
     cmd = [
         "ffmpeg", "-y",
         "-loglevel", "error",
@@ -233,28 +245,10 @@ def _ffmpeg_audio_mp3(audio_url, filename):
         "-c:a", "libmp3lame",
         "-q:a", "2",
         "-f", "mp3",
-        "pipe:1",
     ]
-
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-
-    def generate():
-        try:
-            while True:
-                chunk = proc.stdout.read(65536)
-                if not chunk:
-                    break
-                yield chunk
-        finally:
-            proc.stdout.close()
-            proc.wait()
-
     mp3_filename = filename.rsplit(".", 1)[0] + ".mp3"
-    return Response(
-        stream_with_context(generate()),
-        content_type="audio/mpeg",
-        headers={"Content-Disposition": f'attachment; filename="{mp3_filename}"'},
-    )
+    path, size = _run_ffmpeg_to_tempfile(cmd, ".mp3")
+    return _serve_tempfile(path, size, "audio/mpeg", mp3_filename)
 
 
 def _safe_filename(title, ext):
@@ -339,13 +333,31 @@ def _handle_quality_download(quality, info, combined, video_only, audio_only):
 #  ROUTES
 # ══════════════════════════════════════════════════════
 
+def _bytes_to_human(b):
+    if not b or b <= 0:
+        return None
+    if b < 1024 * 1024:
+        return f"{b / 1024:.1f} KB"
+    if b < 1024 * 1024 * 1024:
+        return f"{b / (1024 * 1024):.1f} MB"
+    return f"{b / (1024 * 1024 * 1024):.2f} GB"
+
+
+def _fmt_raw_bytes(fmt):
+    """Return raw byte count from a format entry, using approx if exact not available."""
+    return fmt.get("filesize") or fmt.get("tbr") and None or None
+
+
 def _build_apk_response(info, combined, video_only, audio_only, youtube_url):
     """Build JSON response in the exact format the VidTube APK expects."""
     base = request.host_url.rstrip("/")
     encoded_url = urllib.parse.quote(youtube_url, safe="")
 
+    # Best audio bytes for merged size estimation
+    best_audio = audio_only[0] if audio_only else None
+    best_audio_bytes = best_audio.get("filesize") if best_audio else 0
+
     # ── Collect distinct video heights available ──────────────────
-    all_video = combined + video_only
     seen_heights = set()
     video_formats = []
     standard_heights = [2160, 1440, 1080, 720, 480, 360, 240, 144]
@@ -358,7 +370,16 @@ def _build_apk_response(info, combined, video_only, audio_only, youtube_url):
         if actual_h in seen_heights:
             continue
         seen_heights.add(actual_h)
-        size = fmt.get("filesize_human") or "Unknown"
+
+        # Merged size = video bytes + audio bytes
+        vid_bytes = fmt.get("filesize")
+        if vid_bytes and best_audio_bytes:
+            size = _bytes_to_human(vid_bytes + best_audio_bytes) or "Unknown"
+        elif vid_bytes:
+            size = _bytes_to_human(vid_bytes) or "Unknown"
+        else:
+            size = fmt.get("filesize_human") or "Unknown"
+
         video_formats.append({
             "quality":     f"{actual_h}p",
             "extension":   "MP4",
@@ -378,7 +399,8 @@ def _build_apk_response(info, combined, video_only, audio_only, youtube_url):
         if abr_key in seen_abr:
             continue
         seen_abr.add(abr_key)
-        size = best.get("filesize_human") or "Unknown"
+        abr_bytes = best.get("filesize")
+        size = _bytes_to_human(abr_bytes) if abr_bytes else (best.get("filesize_human") or "Unknown")
         quality_num = str(target_abr)
         audio_formats.append({
             "quality":     label,
