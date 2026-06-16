@@ -2,7 +2,6 @@ services:
   - type: web
     name: yt-downloader
     env: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --timeout 120 --workers 2
+    buildCommand: apt-get install -y ffmpeg && pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --timeout 300 --workers 2
     plan: free
-    
