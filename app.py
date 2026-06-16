@@ -1,5 +1,6 @@
 import os
 import re
+import urllib.parse
 import urllib.request
 import yt_dlp
 from flask import Flask, request, jsonify, render_template, Response, stream_with_context
@@ -357,10 +358,10 @@ def index():
         except Exception as e:
             return jsonify({"success": False, "error": str(e)}), 500
 
-    # ── Case 2: url only → return JSON with video info + formats ────────
-    # Android app calls /?url=... (no quality) to get the available
-    # qualities before showing the selection UI.  Always return JSON here,
-    # never HTML, so the app can parse it correctly.
+    # ── Case 2: url only → return JSON matching the VidTube app format ──
+    # App reads: data.video.{title,channel,duration,thumbnail}
+    #            data.formats.video[]  → {quality,extension,downloadUrl,size}
+    #            data.formats.audio[]  → {quality,extension,downloadUrl,size}
     if raw_url:
         url = normalize_url(raw_url)
         try:
@@ -372,58 +373,58 @@ def index():
             thumbnail = (info.get("thumbnail")
                          or f"https://i.ytimg.com/vi/{vid_id}/hqdefault.jpg")
             duration  = format_duration(info.get("duration"))
+            base_url  = request.host_url.rstrip("/")
+            encoded   = urllib.parse.quote(raw_url, safe="")
 
-            # Build a simple ordered list of available quality labels so
-            # the app can show a quality picker.
-            seen_q = set()
-            qualities = []
+            # Build video formats list (combined + video_only, deduped by height)
+            seen_h = set()
+            video_formats = []
             for fmt in combined + video_only:
                 h = fmt.get("height")
-                if h:
-                    label = f"{h}p"
-                    if label not in seen_q:
-                        seen_q.add(label)
-                        qualities.append(label)
-            for fmt in audio_only:
-                abr = fmt.get("abr") or fmt.get("tbr") or 0
-                label = f"{int(abr)}" if abr else "48"
-                if label not in seen_q:
-                    seen_q.add(label)
-                    qualities.append(label)
+                if not h or h in seen_h:
+                    continue
+                seen_h.add(h)
+                quality = f"{h}p"
+                video_formats.append({
+                    "quality":     quality,
+                    "extension":   fmt.get("ext", "mp4"),
+                    "size":        fmt.get("filesize_human") or "Unknown",
+                    # App uses downloadUrl first, falls back to API endpoint
+                    "downloadUrl": f"{base_url}/?url={encoded}&quality={quality}",
+                })
 
-            # Return every common field-name variant so any app version matches
+            # Build audio formats list (deduped by bitrate)
+            seen_abr = set()
+            audio_formats = []
+            for fmt in audio_only:
+                tbr = fmt.get("abr") or fmt.get("tbr") or 0
+                abr_int = int(tbr)
+                if not abr_int or abr_int in seen_abr:
+                    continue
+                seen_abr.add(abr_int)
+                # App strips 'k' → sends quality=128, quality=48 to download
+                audio_formats.append({
+                    "quality":     f"{abr_int}k",
+                    "extension":   fmt.get("ext", "m4a"),
+                    "size":        fmt.get("filesize_human") or "Unknown",
+                    "downloadUrl": f"{base_url}/?url={encoded}&quality={abr_int}",
+                })
+
             return jsonify({
-                # ── status ──────────────────────────────────────────────
-                "success":          True,
-                "status":           "ok",
-                # ── identity ─────────────────────────────────────────────
-                "id":               vid_id,
-                "videoId":          vid_id,
-                # ── title (multiple aliases) ─────────────────────────────
-                "title":            title,
-                "videoTitle":       title,
-                "name":             title,
-                # ── channel (multiple aliases) ───────────────────────────
-                "channel":          channel,
-                "channelName":      channel,
-                "author":           channel,
-                "uploader":         channel,
-                # ── media metadata ───────────────────────────────────────
-                "thumbnail":        thumbnail,
-                "thumbnailUrl":     thumbnail,
-                "duration":         duration,
-                "durationSeconds":  info.get("duration"),
-                # ── quality list (simple labels for picker UI) ───────────
-                "qualities":        qualities,
-                "availableQualities": qualities,
-                # ── full format detail (for advanced clients) ────────────
-                "formats": {
-                    "combined":   combined,
-                    "video_only": video_only,
-                    "audio_only": audio_only,
+                "success": True,
+                # ── video metadata (app reads data.video.*) ──────────────
+                "video": {
+                    "title":     title,
+                    "channel":   channel,
+                    "duration":  duration,
+                    "thumbnail": thumbnail,
+                    "id":        vid_id,
                 },
-                "formats_flat":   combined + video_only + audio_only,
-                "formats_count":  len(combined) + len(video_only) + len(audio_only),
+                # ── formats (app reads data.formats.video / .audio) ──────
+                "formats": {
+                    "video": video_formats,
+                    "audio": audio_formats,
+                },
             })
         except Exception as e:
             return jsonify({"success": False, "error": str(e)}), 500
