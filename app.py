@@ -341,6 +341,7 @@ def index():
     raw_url = request.args.get("url", "").strip()
     quality  = request.args.get("quality", "").strip()
 
+    # ── Case 1: url + quality → stream binary video/audio ──────────────
     if raw_url and quality:
         url = normalize_url(raw_url)
         try:
@@ -356,6 +357,35 @@ def index():
         except Exception as e:
             return jsonify({"success": False, "error": str(e)}), 500
 
+    # ── Case 2: url only → return JSON with video info + formats ────────
+    # Android app calls /?url=... (no quality) to get the available
+    # qualities before showing the selection UI.  Always return JSON here,
+    # never HTML, so the app can parse it correctly.
+    if raw_url:
+        url = normalize_url(raw_url)
+        try:
+            info = extract_info(url)
+            combined, video_only, audio_only = parse_formats(info)
+            vid_id = info.get("id", "")
+            return jsonify({
+                "success":   True,
+                "id":        vid_id,
+                "title":     info.get("title"),
+                "thumbnail": info.get("thumbnail") or f"https://i.ytimg.com/vi/{vid_id}/hqdefault.jpg",
+                "duration":  format_duration(info.get("duration")),
+                "channel":   info.get("uploader") or info.get("channel"),
+                "formats": {
+                    "combined":   combined,
+                    "video_only": video_only,
+                    "audio_only": audio_only,
+                },
+                "formats_flat":  combined + video_only + audio_only,
+                "formats_count": len(combined) + len(video_only) + len(audio_only),
+            })
+        except Exception as e:
+            return jsonify({"success": False, "error": str(e)}), 500
+
+    # ── Case 3: no params → serve the web UI ────────────────────────────
     return render_template("index.html")
 
 
