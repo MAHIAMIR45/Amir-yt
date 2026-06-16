@@ -9,8 +9,6 @@ app = Flask(__name__)
 CORS(app)
 
 # ── Cookies file (Netscape format) ──
-# Sits in the project root. yt-dlp uses it for both the watch page and the
-# player API requests so the server isn't bot-detected on Render.
 _COOKIE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
 
 # ── Modern Chrome User-Agent ──
@@ -19,6 +17,33 @@ _USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/120.0.0.0 Safari/537.36"
 )
+
+
+# ══════════════════════════════════════════════════════
+#  GLOBAL JSON ERROR HANDLERS
+#  (Flask by default returns HTML error pages — Android
+#   app expects JSON, so we override all error responses)
+# ══════════════════════════════════════════════════════
+
+@app.errorhandler(400)
+def bad_request(e):
+    return jsonify({"success": False, "error": str(e)}), 400
+
+@app.errorhandler(404)
+def not_found(e):
+    return jsonify({"success": False, "error": "Not found"}), 404
+
+@app.errorhandler(405)
+def method_not_allowed(e):
+    return jsonify({"success": False, "error": "Method not allowed"}), 405
+
+@app.errorhandler(500)
+def internal_error(e):
+    return jsonify({"success": False, "error": "Internal server error"}), 500
+
+@app.errorhandler(Exception)
+def handle_exception(e):
+    return jsonify({"success": False, "error": str(e)}), 500
 
 
 def normalize_url(link):
@@ -33,36 +58,65 @@ def normalize_url(link):
     return link
 
 
-def get_ydl_opts():
-    """Build yt-dlp options that work reliably on server IPs.
-
-    Requires the yt-dlp-ejs Python package (pip install yt-dlp-ejs) and
-    Node.js to be available.  yt-dlp-ejs provides the EJS challenge solver
-    that decrypts YouTube's n-challenge and signature, which is necessary
-    to get actual video/audio URLs from server IPs.
-    """
+def _base_opts():
+    """Shared quiet/network options used by every extraction path."""
     import shutil
     node_path = shutil.which("node") or "node"
-
-    opts = {
-        "quiet":             True,
-        "no_warnings":       True,
-        "skip_download":     True,
-        "noplaylist":        True,
-        "retries":           5,
-        "fragment_retries":  5,
+    return {
+        "quiet":              True,
+        "no_warnings":        True,
+        "skip_download":      True,
+        "noplaylist":         True,
+        "retries":            5,
+        "fragment_retries":   5,
         "skip_unavailable_fragments": True,
-        "http_headers":      {"User-Agent": _USER_AGENT},
-        "js_runtimes":       {"node": {"path": node_path}},
+        "http_headers":       {"User-Agent": _USER_AGENT},
+        "js_runtimes":        {"node": {"path": node_path}},
     }
+
+
+def get_ydl_opts():
+    """Return yt-dlp opts with cookies (primary path, works on Render)."""
+    opts = _base_opts()
     if os.path.isfile(_COOKIE_FILE):
         opts["cookiefile"] = _COOKIE_FILE
     return opts
 
 
+def _android_vr_opts():
+    """Fallback opts: Android VR player, no cookies, process=False-friendly."""
+    opts = _base_opts()
+    opts["extractor_args"] = {
+        "youtube": {
+            "player_client": ["android_vr"],
+            "skip_webpage":  ["1"],
+        }
+    }
+    return opts
+
+
 def extract_info(url):
-    with yt_dlp.YoutubeDL(get_ydl_opts()) as ydl:
-        return ydl.extract_info(url, download=False)
+    """Extract video info with automatic fallback.
+
+    1. Primary  : cookies + js_runtimes + process=True  (works on Render
+                  with valid cookies.txt).
+    2. Fallback : Android VR player + process=False      (works anywhere
+                  without cookies or a JS runtime).
+    """
+    # Primary: cookies path
+    try:
+        with yt_dlp.YoutubeDL(get_ydl_opts()) as ydl:
+            info = ydl.extract_info(url, download=False)
+        # Verify we actually got usable formats (not just images)
+        fmts = info.get("formats", [])
+        if any(f.get("url") and f.get("vcodec", "none") not in (None, "none") for f in fmts):
+            return info
+    except Exception:
+        pass
+
+    # Fallback: Android VR player, bypass format selector entirely
+    with yt_dlp.YoutubeDL(_android_vr_opts()) as ydl:
+        return ydl.extract_info(url, download=False, process=False)
 
 
 def format_duration(seconds):
@@ -178,6 +232,9 @@ def _find_format_by_quality(quality, combined, video_only, audio_only):
     if q.isdigit():
         target_abr = int(q)
         candidates = [f for f in audio_only if _is_direct_url(f.get("url"))]
+        # If no direct URL, accept any audio URL
+        if not candidates:
+            candidates = audio_only
         best = min(candidates, key=lambda f: abs((f.get("abr") or 0) - target_abr), default=None)
         if best:
             ext = best.get("ext", "m4a")
@@ -211,6 +268,20 @@ def _find_format_by_quality(quality, combined, video_only, audio_only):
                 ext = fmt.get("ext", "mp4")
                 return fmt["url"], ext, "video/mp4"
 
+        # Last resort: any combined/video format (no direct URL filter)
+        for fmt in combined:
+            if fmt.get("height") == target_h:
+                ext = fmt.get("ext", "mp4")
+                return fmt["url"], ext, "video/mp4"
+        for fmt in combined:
+            if (fmt.get("height") or 0) <= target_h:
+                ext = fmt.get("ext", "mp4")
+                return fmt["url"], ext, "video/mp4"
+        for fmt in video_only:
+            if (fmt.get("height") or 0) <= target_h:
+                ext = fmt.get("ext", "mp4")
+                return fmt["url"], ext, "video/mp4"
+
     return None, None, None
 
 
@@ -232,12 +303,12 @@ def _proxy_stream(stream_url, filename, content_type):
     try:
         upstream = urllib.request.urlopen(req, timeout=30)
     except urllib.error.HTTPError as e:
-        return jsonify({"error": f"Upstream error {e.code}"}), 502
+        return jsonify({"success": False, "error": f"Upstream error {e.code}"}), 502
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"success": False, "error": str(e)}), 500
 
-    status       = upstream.status
-    content_len  = upstream.headers.get("Content-Length")
+    status        = upstream.status
+    content_len   = upstream.headers.get("Content-Length")
     accept_ranges = upstream.headers.get("Accept-Ranges", "bytes")
 
     resp_headers = {
@@ -281,9 +352,9 @@ def index():
                 title    = info.get("title", "video")
                 filename = _safe_filename(title, ext)
                 return _proxy_stream(stream_url, filename, content_type)
-            return jsonify({"error": f"Quality '{quality}' not available"}), 404
+            return jsonify({"success": False, "error": f"Quality '{quality}' not available"}), 404
         except Exception as e:
-            return jsonify({"error": str(e)}), 500
+            return jsonify({"success": False, "error": str(e)}), 500
 
     return render_template("index.html")
 
@@ -322,8 +393,6 @@ def search():
         return jsonify({"error": str(e)}), 500
 
 
-# ── /download/audio?url=<youtube_url>
-#    Returns JSON: best_audio + all_audio_formats with direct download URLs
 @app.route("/download/audio")
 @app.route("/download/audio/<path:link>")
 def download_audio(link=None):
@@ -349,8 +418,6 @@ def download_audio(link=None):
         return jsonify({"status": "error", "error": str(e)}), 500
 
 
-# ── /download/video?url=<youtube_url>
-#    Returns JSON: all formats (combined / video_only / audio_only) with direct download URLs
 @app.route("/download/video")
 @app.route("/download/video/<path:link>")
 def download_video(link=None):
