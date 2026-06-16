@@ -366,21 +366,64 @@ def index():
         try:
             info = extract_info(url)
             combined, video_only, audio_only = parse_formats(info)
-            vid_id = info.get("id", "")
+            vid_id    = info.get("id", "")
+            title     = info.get("title") or ""
+            channel   = info.get("uploader") or info.get("channel") or ""
+            thumbnail = (info.get("thumbnail")
+                         or f"https://i.ytimg.com/vi/{vid_id}/hqdefault.jpg")
+            duration  = format_duration(info.get("duration"))
+
+            # Build a simple ordered list of available quality labels so
+            # the app can show a quality picker.
+            seen_q = set()
+            qualities = []
+            for fmt in combined + video_only:
+                h = fmt.get("height")
+                if h:
+                    label = f"{h}p"
+                    if label not in seen_q:
+                        seen_q.add(label)
+                        qualities.append(label)
+            for fmt in audio_only:
+                abr = fmt.get("abr") or fmt.get("tbr") or 0
+                label = f"{int(abr)}" if abr else "48"
+                if label not in seen_q:
+                    seen_q.add(label)
+                    qualities.append(label)
+
+            # Return every common field-name variant so any app version matches
             return jsonify({
-                "success":   True,
-                "id":        vid_id,
-                "title":     info.get("title"),
-                "thumbnail": info.get("thumbnail") or f"https://i.ytimg.com/vi/{vid_id}/hqdefault.jpg",
-                "duration":  format_duration(info.get("duration")),
-                "channel":   info.get("uploader") or info.get("channel"),
+                # ── status ──────────────────────────────────────────────
+                "success":          True,
+                "status":           "ok",
+                # ── identity ─────────────────────────────────────────────
+                "id":               vid_id,
+                "videoId":          vid_id,
+                # ── title (multiple aliases) ─────────────────────────────
+                "title":            title,
+                "videoTitle":       title,
+                "name":             title,
+                # ── channel (multiple aliases) ───────────────────────────
+                "channel":          channel,
+                "channelName":      channel,
+                "author":           channel,
+                "uploader":         channel,
+                # ── media metadata ───────────────────────────────────────
+                "thumbnail":        thumbnail,
+                "thumbnailUrl":     thumbnail,
+                "duration":         duration,
+                "durationSeconds":  info.get("duration"),
+                # ── quality list (simple labels for picker UI) ───────────
+                "qualities":        qualities,
+                "availableQualities": qualities,
+                # ── full format detail (for advanced clients) ────────────
                 "formats": {
                     "combined":   combined,
                     "video_only": video_only,
                     "audio_only": audio_only,
                 },
-                "formats_flat":  combined + video_only + audio_only,
-                "formats_count": len(combined) + len(video_only) + len(audio_only),
+                "formats_flat":   combined + video_only + audio_only,
+                "formats_count":  len(combined) + len(video_only) + len(audio_only),
             })
         except Exception as e:
             return jsonify({"success": False, "error": str(e)}), 500
