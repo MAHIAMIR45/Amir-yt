@@ -7,6 +7,12 @@ import yt_dlp
 from flask import Flask, request, jsonify, render_template, Response, stream_with_context
 from flask_cors import CORS
 
+try:
+    import static_ffmpeg
+    static_ffmpeg.add_paths()
+except Exception:
+    pass
+
 app = Flask(__name__)
 CORS(app)
 
