@@ -1,5 +1,7 @@
 import os
 import re
+import time
+import threading
 import subprocess
 import urllib.parse
 import urllib.request
@@ -16,13 +18,107 @@ except Exception:
 app = Flask(__name__)
 CORS(app)
 
-_COOKIE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 _USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/120.0.0.0 Safari/537.36"
 )
+
+# ══════════════════════════════════════════════════════
+#  COOKIE ROTATION SYSTEM
+#  Place cookie files as: cookies1.txt, cookies2.txt, ... cookies10.txt
+#  Legacy cookies.txt is also supported as fallback
+# ══════════════════════════════════════════════════════
+
+_COOLDOWN_SECONDS = 300  # 5 min cooldown after a cookie gets blocked
+
+class CookiePool:
+    """
+    Strict round-robin cookie rotation.
+
+    Cookie files are loaded in this order:
+      cookies.txt  →  cookies1.txt  →  cookies2.txt  →  ...  →  cookies10.txt
+
+    Each request gets the NEXT cookie in the sequence.
+    If a cookie gets a YouTube block error it is put on cooldown and the
+    next available slot is used for that request only — the counter keeps
+    moving forward so all cookies stay balanced.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._index = 0
+        self._blocked_until = {}      # path -> unblock timestamp
+        self._use_count = {}          # path -> total uses
+
+    def _load_cookies(self):
+        """Return ordered list of existing cookie files."""
+        candidates = []
+        # cookies.txt first (slot 0)
+        legacy = os.path.join(_BASE_DIR, "cookies.txt")
+        if os.path.isfile(legacy):
+            candidates.append(legacy)
+        # cookies1.txt … cookies10.txt
+        for i in range(1, 11):
+            p = os.path.join(_BASE_DIR, f"cookies{i}.txt")
+            if os.path.isfile(p):
+                candidates.append(p)
+        return candidates
+
+    def get_next(self):
+        """
+        Advance the round-robin counter and return the assigned cookie.
+        Skips cookies currently on cooldown; falls back to the least-blocked
+        one if every cookie is on cooldown.
+        Returns None when no cookie files exist at all.
+        """
+        with self._lock:
+            cookies = self._load_cookies()
+            if not cookies:
+                return None
+
+            now = time.time()
+            total = len(cookies)
+
+            # Walk forward until we find an unblocked slot
+            for _ in range(total):
+                path = cookies[self._index % total]
+                self._index = (self._index + 1) % total
+                if now >= self._blocked_until.get(path, 0):
+                    self._use_count[path] = self._use_count.get(path, 0) + 1
+                    return path
+
+            # Every cookie is on cooldown — use the one that unblocks soonest
+            soonest = min(cookies, key=lambda p: self._blocked_until.get(p, 0))
+            self._use_count[soonest] = self._use_count.get(soonest, 0) + 1
+            return soonest
+
+    def mark_blocked(self, cookie_path):
+        """Put a cookie on cooldown."""
+        with self._lock:
+            self._blocked_until[cookie_path] = time.time() + _COOLDOWN_SECONDS
+            print(f"[CookiePool] BLOCKED: {os.path.basename(cookie_path)} "
+                  f"— cooldown {_COOLDOWN_SECONDS}s")
+
+    def status(self):
+        """Return list of dicts describing every cookie's current state."""
+        cookies = self._load_cookies()
+        now = time.time()
+        out = []
+        for p in cookies:
+            remaining = max(0, self._blocked_until.get(p, 0) - now)
+            out.append({
+                "file":                  os.path.basename(p),
+                "status":                "blocked" if remaining > 0 else "active",
+                "cooldown_remaining_sec": int(remaining),
+                "total_uses":            self._use_count.get(p, 0),
+            })
+        return out
+
+
+_cookie_pool = CookiePool()
 
 
 def normalize_url(link):
@@ -36,35 +132,124 @@ def normalize_url(link):
     return link
 
 
-def get_ydl_opts():
+def _is_cookie_error(exc):
+    """Detect if an exception is caused by YouTube bot/cookie block."""
+    msg = str(exc).lower()
+    return any(k in msg for k in [
+        "sign in", "signin", "bot", "429", "too many requests",
+        "confirm you're not a bot", "this video is unavailable",
+        "blocked", "cookie", "captcha", "please sign in",
+    ])
+
+
+def _is_nsig_error(exc):
+    """Detect YouTube n-challenge / signature solving failure."""
+    msg = str(exc).lower()
+    return any(k in msg for k in [
+        "signature solving failed", "n challenge", "requested format is not available",
+        "only images are available",
+    ])
+
+
+def get_ydl_opts(cookie_path=None, player_client=None):
     import shutil
     node_path = shutil.which("node") or "node"
+    # Ensure node directory is in PATH so yt-dlp can find it
+    node_dir = os.path.dirname(node_path)
+    current_path = os.environ.get("PATH", "")
+    if node_dir and node_dir not in current_path:
+        os.environ["PATH"] = node_dir + ":" + current_path
 
     opts = {
-        "quiet":             True,
-        "no_warnings":       True,
-        "skip_download":     True,
-        "noplaylist":        True,
-        "retries":           5,
-        "fragment_retries":  5,
+        "quiet":                      True,
+        "no_warnings":                True,
+        "skip_download":              True,
+        "noplaylist":                 True,
+        "retries":                    3,
+        "fragment_retries":           3,
         "skip_unavailable_fragments": True,
-        "http_headers":      {"User-Agent": _USER_AGENT},
-        "js_runtimes":       {"node": {"path": node_path}},
+        "http_headers":               {"User-Agent": _USER_AGENT},
+        "js_runtimes":                {"node": {"path": node_path}},
     }
-    if os.path.isfile(_COOKIE_FILE):
-        opts["cookiefile"] = _COOKIE_FILE
+    if cookie_path and os.path.isfile(cookie_path):
+        opts["cookiefile"] = cookie_path
+    if player_client:
+        opts["extractor_args"] = {"youtube": {"player_client": [player_client]}}
     return opts
 
 
+def _ydl_extract(opts, url):
+    """Run yt-dlp extract_info and raise if result has no real formats."""
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+    # Reject storyboard-only results (no real video/audio)
+    fmts = info.get("formats", [])
+    real = [f for f in fmts if f.get("ext") not in ("mhtml", None) and f.get("url")]
+    if not real:
+        raise RuntimeError("No downloadable formats found (storyboard only)")
+    return info
+
+
 def extract_info(url):
-    opts = get_ydl_opts()
+    """
+    Extract info with smart fallback strategy:
+
+    Round 1 — assigned cookie + default player (handles age-gated content)
+    Round 2 — if n-challenge/sig fails: try all other cookies with default player
+    Round 3 — mediaconnect client without cookie (works when JS solving fails)
+    Round 4 — mediaconnect client with each cookie (final attempt)
+    """
+    assigned  = _cookie_pool.get_next()
+    others    = [c for c in _cookie_pool._load_cookies() if c != assigned]
+    last_exc  = None
+    is_cookie = False
+    is_nsig   = False
+
+    # ── Round 1: assigned cookie, default player ──────────────────────
     try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            return ydl.extract_info(url, download=False)
-    except Exception:
-        opts_no_cookie = {k: v for k, v in opts.items() if k != "cookiefile"}
-        with yt_dlp.YoutubeDL(opts_no_cookie) as ydl:
-            return ydl.extract_info(url, download=False)
+        info = _ydl_extract(get_ydl_opts(assigned), url)
+        if assigned:
+            print(f"[YDL] OK cookie={os.path.basename(assigned)}")
+        return info
+    except Exception as e:
+        last_exc  = e
+        is_cookie = bool(assigned and _is_cookie_error(e))
+        is_nsig   = _is_nsig_error(e)
+        if not (is_cookie or is_nsig):
+            raise
+        if is_cookie:
+            _cookie_pool.mark_blocked(assigned)
+
+    # ── Round 2: other cookies, default player (only on cookie error) ──
+    if is_cookie:
+        for c in others:
+            try:
+                info = _ydl_extract(get_ydl_opts(c), url)
+                print(f"[YDL] OK cookie fallback={os.path.basename(c)}")
+                return info
+            except Exception as e:
+                last_exc = e
+                if _is_cookie_error(e):
+                    _cookie_pool.mark_blocked(c)
+
+    # ── Round 3: mediaconnect without cookie (bypasses n-challenge) ───
+    try:
+        info = _ydl_extract(get_ydl_opts(player_client="mediaconnect"), url)
+        print("[YDL] OK mediaconnect no-cookie")
+        return info
+    except Exception as e:
+        last_exc = e
+
+    # ── Round 4: mediaconnect with each cookie ─────────────────────────
+    for c in ([assigned] if assigned else []) + others:
+        try:
+            info = _ydl_extract(get_ydl_opts(c, player_client="mediaconnect"), url)
+            print(f"[YDL] OK mediaconnect cookie={os.path.basename(c)}")
+            return info
+        except Exception as e:
+            last_exc = e
+
+    raise last_exc
 
 
 def format_duration(seconds):
@@ -454,38 +639,88 @@ def index():
     return render_template("index.html")
 
 
+@app.route("/cookie-status")
+def cookie_status():
+    """Show status of all cookie files — which are active and which are on cooldown."""
+    return jsonify({
+        "cookies": _cookie_pool.status(),
+        "cooldown_seconds": _COOLDOWN_SECONDS,
+    })
+
+
 @app.route("/search")
 def search():
     query = request.args.get("q", "").strip()
     limit = int(request.args.get("limit", 12))
     if not query:
         return jsonify({"error": "Query is required"}), 400
-    try:
-        opts = get_ydl_opts()
+
+    def _do_search(cookie_path=None, player_client=None):
+        opts = get_ydl_opts(cookie_path, player_client)
         opts["extract_flat"] = True
         opts["playlistend"]  = limit
         with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
-        videos = []
-        for entry in info.get("entries", []):
-            if not entry:
-                continue
-            vid_id     = entry.get("id", "")
-            thumbnails = entry.get("thumbnails") or []
-            thumb = (thumbnails[-1]["url"] if thumbnails
-                     else f"https://i.ytimg.com/vi/{vid_id}/hqdefault.jpg")
-            videos.append({
-                "id":        vid_id,
-                "title":     entry.get("title", ""),
-                "thumbnail": thumb,
-                "duration":  format_duration(entry.get("duration")),
-                "channel":   entry.get("channel") or entry.get("uploader") or "",
-                "views":     entry.get("view_count"),
-                "url":       entry.get("url") or f"https://www.youtube.com/watch?v={vid_id}",
-            })
-        return jsonify({"results": videos})
+            return ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
+
+    assigned = _cookie_pool.get_next()
+    info = None
+    last_exc = None
+
+    # Round 1: assigned cookie
+    try:
+        info = _do_search(assigned)
+        if assigned:
+            print(f"[Search] OK → {os.path.basename(assigned)}")
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        last_exc = e
+        is_cookie = assigned and _is_cookie_error(e)
+        is_nsig   = _is_nsig_error(e)
+        if is_cookie:
+            _cookie_pool.mark_blocked(assigned)
+        if not (is_cookie or is_nsig):
+            return jsonify({"error": str(e)}), 500
+
+    # Round 2: other cookies (only if cookie error)
+    if info is None and is_cookie:
+        for c in [x for x in _cookie_pool._load_cookies() if x != assigned]:
+            try:
+                info = _do_search(c)
+                print(f"[Search] OK fallback → {os.path.basename(c)}")
+                break
+            except Exception as e:
+                last_exc = e
+                if _is_cookie_error(e):
+                    _cookie_pool.mark_blocked(c)
+
+    # Round 3: mediaconnect without cookie
+    if info is None:
+        try:
+            info = _do_search(player_client="mediaconnect")
+            print("[Search] OK → mediaconnect (no cookie)")
+        except Exception as e:
+            last_exc = e
+
+    if info is None:
+        return jsonify({"error": str(last_exc)}), 500
+
+    videos = []
+    for entry in info.get("entries", []):
+        if not entry:
+            continue
+        vid_id     = entry.get("id", "")
+        thumbnails = entry.get("thumbnails") or []
+        thumb = (thumbnails[-1]["url"] if thumbnails
+                 else f"https://i.ytimg.com/vi/{vid_id}/hqdefault.jpg")
+        videos.append({
+            "id":        vid_id,
+            "title":     entry.get("title", ""),
+            "thumbnail": thumb,
+            "duration":  format_duration(entry.get("duration")),
+            "channel":   entry.get("channel") or entry.get("uploader") or "",
+            "views":     entry.get("view_count"),
+            "url":       entry.get("url") or f"https://www.youtube.com/watch?v={vid_id}",
+        })
+    return jsonify({"results": videos})
 
 
 @app.route("/download/audio")
