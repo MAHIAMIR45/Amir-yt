@@ -61,49 +61,44 @@ def normalize_url(link):
 def get_ydl_opts():
     """Build yt-dlp options for info extraction (no download).
 
-    Key settings:
-    - check_formats=False  : skip URL validation so format-selector
-                             never rejects formats because of unsolvable
-                             n-challenge on server IPs (no JS runtime).
-    - format='best/...'    : very permissive chain so selection always
-                             succeeds and we always get info['formats'].
+    Key design decisions:
+    - extractor_args android_vr + skip_webpage: forces the Android VR
+      player API which returns 31 raw formats (incl. format 18, 360p
+      combined) WITHOUT needing a JS runtime to solve the n-challenge.
+    - No cookiefile: cookies from a mobile browser on a local IP are
+      rejected by Google when used from a server IP (US/EU), and they
+      also cause yt-dlp to switch to the "tv downgraded" player which
+      requires n-challenge — worse than no cookies at all.
+    - process=False (in extract_info): bypasses yt-dlp's format-selector
+      entirely so "Requested format is not available" can never occur.
     """
-    opts = {
+    return {
         "quiet":              True,
         "no_warnings":        True,
-        "skip_download":      True,
         "noplaylist":         True,
         "retries":            5,
         "geo_bypass":         True,
         "geo_bypass_country": "PK",
-        "http_headers":       {"User-Agent": _USER_AGENT},
-        # Don't check whether format URLs are reachable during selection
-        "check_formats":      False,
-        # Permissive chain: combined → video-only → audio-only → worst
-        "format":             "best/bestvideo/bestaudio/worst",
+        # Force the Android VR player — works without JS runtime / cookies
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android_vr"],
+                "skip_webpage":  ["1"],
+            }
+        },
     }
-    if os.path.isfile(_COOKIE_FILE):
-        opts["cookiefile"] = _COOKIE_FILE
-    return opts
 
 
 def extract_info(url):
-    """Extract video info with fallback to raw extraction.
+    """Return raw video info using the Android VR player API.
 
-    Primary: process=True with check_formats=False so format-selector
-    always succeeds even without a JS runtime (Render / server IPs).
-
-    Fallback: process=False returns raw YouTube API data and bypasses
-    format-selection entirely — used if the primary path still raises.
+    process=False bypasses yt-dlp's internal format-selector so we
+    always receive the complete info['formats'] list and do our own
+    quality selection.  This works on any server IP without a JS
+    runtime or YouTube cookies.
     """
-    opts = get_ydl_opts()
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            return ydl.extract_info(url, download=False)
-    except Exception:
-        # If process=True still fails, get raw formats without any selection
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            return ydl.extract_info(url, download=False, process=False)
+    with yt_dlp.YoutubeDL(get_ydl_opts()) as ydl:
+        return ydl.extract_info(url, download=False, process=False)
 
 
 def format_duration(seconds):
