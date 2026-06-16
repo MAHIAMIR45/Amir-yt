@@ -239,16 +239,18 @@ def _find_format_by_quality(quality, combined, video_only, audio_only):
     Video qualities : '1080p', '720p', '480p', '360p', '240p', '144p'
     Audio qualities : '128', '48'  (kbps as a plain integer string)
 
-    Only direct videoplayback URLs are returned — HLS/manifest URLs are
-    skipped so the proxy can stream raw bytes to the client.
+    ONLY direct videoplayback URLs are returned — DASH/HLS manifest URLs
+    cause 0-byte downloads because they are XML, not raw video bytes.
+    If the requested quality has no direct URL we step down to the best
+    lower quality that does have one.
     """
     q = quality.strip().lower()
 
     # ── Audio ───────────────────────────────────────────────────
     if q.isdigit():
         target_abr = int(q)
+        # Prefer direct URLs; fall back to any URL only for audio
         candidates = [f for f in audio_only if _is_direct_url(f.get("url"))]
-        # If no direct URL, accept any audio URL
         if not candidates:
             candidates = audio_only
         best = min(candidates, key=lambda f: abs((f.get("abr") or 0) - target_abr), default=None)
@@ -262,41 +264,26 @@ def _find_format_by_quality(quality, combined, video_only, audio_only):
     if q.endswith("p") and q[:-1].isdigit():
         target_h = int(q[:-1])
 
-        # Prefer direct combined (video + audio in one file) — exact then closest
+        # Step 1 — direct combined (video+audio): exact match then step-down
         direct_combined = [f for f in combined if _is_direct_url(f.get("url"))]
         for fmt in direct_combined:
             if fmt.get("height") == target_h:
-                ext = fmt.get("ext", "mp4")
-                return fmt["url"], ext, "video/mp4"
-        for fmt in direct_combined:
+                return fmt["url"], fmt.get("ext", "mp4"), "video/mp4"
+        for fmt in direct_combined:           # sorted high→low, so first ≤ target
             if (fmt.get("height") or 0) <= target_h:
-                ext = fmt.get("ext", "mp4")
-                return fmt["url"], ext, "video/mp4"
+                return fmt["url"], fmt.get("ext", "mp4"), "video/mp4"
 
-        # Fall back to direct video-only — exact then closest
+        # Step 2 — direct video-only: exact match then step-down
         direct_video = [f for f in video_only if _is_direct_url(f.get("url"))]
         for fmt in direct_video:
             if fmt.get("height") == target_h:
-                ext = fmt.get("ext", "mp4")
-                return fmt["url"], ext, "video/mp4"
+                return fmt["url"], fmt.get("ext", "mp4"), "video/mp4"
         for fmt in direct_video:
             if (fmt.get("height") or 0) <= target_h:
-                ext = fmt.get("ext", "mp4")
-                return fmt["url"], ext, "video/mp4"
+                return fmt["url"], fmt.get("ext", "mp4"), "video/mp4"
 
-        # Last resort: any combined/video format (no direct URL filter)
-        for fmt in combined:
-            if fmt.get("height") == target_h:
-                ext = fmt.get("ext", "mp4")
-                return fmt["url"], ext, "video/mp4"
-        for fmt in combined:
-            if (fmt.get("height") or 0) <= target_h:
-                ext = fmt.get("ext", "mp4")
-                return fmt["url"], ext, "video/mp4"
-        for fmt in video_only:
-            if (fmt.get("height") or 0) <= target_h:
-                ext = fmt.get("ext", "mp4")
-                return fmt["url"], ext, "video/mp4"
+        # Step 3 — NO manifest fallback: manifest URLs produce 0-byte files.
+        # If nothing direct is available, tell the client so it can show an error.
 
     return None, None, None
 
@@ -391,6 +378,25 @@ def index():
             base_url  = request.host_url.rstrip("/")
             encoded   = urllib.parse.quote(raw_url, safe="")
 
+            # Duration in seconds — used to estimate size when direct size unavailable
+            duration_secs = info.get("duration") or 0
+
+            def _size_str(fmt, is_audio=False):
+                """Return human-readable size: explicit → clen → bitrate estimate."""
+                s = fmt.get("filesize_human")
+                if s:
+                    return s
+                # Estimate from bitrate × duration
+                if duration_secs:
+                    if is_audio:
+                        kbps = fmt.get("abr") or fmt.get("tbr") or 0
+                    else:
+                        kbps = fmt.get("tbr") or fmt.get("vbr") or 0
+                    if kbps:
+                        est = int(kbps * 1000 / 8 * duration_secs)
+                        return format_filesize(est)
+                return "N/A"
+
             # Build video formats list — all qualities with sizes.
             # combined formats (video+audio) come first so the app shows
             # the best gallery-compatible option at the top.
@@ -405,7 +411,7 @@ def index():
                 video_formats.append({
                     "quality":     quality,
                     "extension":   fmt.get("ext", "mp4"),
-                    "size":        fmt.get("filesize_human") or "Unknown",
+                    "size":        _size_str(fmt),
                     "downloadUrl": f"{base_url}/?url={encoded}&quality={quality}",
                 })
 
@@ -422,7 +428,7 @@ def index():
                 audio_formats.append({
                     "quality":     f"{abr_int}k",
                     "extension":   fmt.get("ext", "m4a"),
-                    "size":        fmt.get("filesize_human") or "Unknown",
+                    "size":        _size_str(fmt, is_audio=True),
                     "downloadUrl": f"{base_url}/?url={encoded}&quality={abr_int}",
                 })
 
