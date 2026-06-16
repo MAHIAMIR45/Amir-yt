@@ -143,14 +143,29 @@ def format_filesize(size):
         return f"{size / (1024 * 1024 * 1024):.2f} GB"
 
 
+def _clen_from_url(url):
+    """Extract content-length from YouTube videoplayback URL's clen param."""
+    if not url:
+        return None
+    try:
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+        clen = qs.get("clen", [None])[0]
+        return int(clen) if clen else None
+    except Exception:
+        return None
+
+
 def build_format_entry(fmt):
-    vcodec   = fmt.get("vcodec") or "none"
-    acodec   = fmt.get("acodec") or "none"
+    vcodec    = fmt.get("vcodec") or "none"
+    acodec    = fmt.get("acodec") or "none"
     has_video = vcodec not in (None, "none")
     has_audio = acodec not in (None, "none")
-    height   = fmt.get("height")
-    width    = fmt.get("width")
-    size     = fmt.get("filesize") or fmt.get("filesize_approx")
+    height    = fmt.get("height")
+    width     = fmt.get("width")
+    url       = fmt.get("url")
+    # filesize: prefer explicit field, fall back to clen in the URL
+    size = (fmt.get("filesize") or fmt.get("filesize_approx")
+            or _clen_from_url(url))
     return {
         "format_id":      fmt.get("format_id"),
         "ext":            fmt.get("ext"),
@@ -169,7 +184,7 @@ def build_format_entry(fmt):
         "format_note":    fmt.get("format_note") or "",
         "has_video":      has_video,
         "has_audio":      has_audio,
-        "url":            fmt.get("url"),
+        "url":            url,
     }
 
 
@@ -376,7 +391,9 @@ def index():
             base_url  = request.host_url.rstrip("/")
             encoded   = urllib.parse.quote(raw_url, safe="")
 
-            # Build video formats list (combined + video_only, deduped by height)
+            # Build video formats list — all qualities with sizes.
+            # combined formats (video+audio) come first so the app shows
+            # the best gallery-compatible option at the top.
             seen_h = set()
             video_formats = []
             for fmt in combined + video_only:
@@ -389,7 +406,6 @@ def index():
                     "quality":     quality,
                     "extension":   fmt.get("ext", "mp4"),
                     "size":        fmt.get("filesize_human") or "Unknown",
-                    # App uses downloadUrl first, falls back to API endpoint
                     "downloadUrl": f"{base_url}/?url={encoded}&quality={quality}",
                 })
 
