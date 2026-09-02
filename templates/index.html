@@ -39,6 +39,12 @@ nav{
 }
 .nav-btn:hover{color:var(--text);background:rgba(255,255,255,0.05);}
 .nav-btn.active{color:#fff;background:rgba(255,45,45,0.15);}
+.admin-btn{
+  margin-left:8px;text-decoration:none;display:inline-flex;align-items:center;gap:6px;
+  background:linear-gradient(135deg,rgba(255,45,45,.16),rgba(255,107,53,.10));
+  border:1px solid rgba(255,45,45,.35);
+}
+.admin-btn:hover{background:linear-gradient(135deg,rgba(255,45,45,.28),rgba(255,107,53,.20));}
 .hamburger{display:none;flex-direction:column;gap:5px;cursor:pointer;padding:5px;background:none;border:none;}
 .hamburger span{display:block;width:22px;height:2px;background:var(--text);border-radius:2px;transition:all .3s;}
 .mobile-menu{
@@ -50,6 +56,11 @@ nav{
 .mobile-menu.open{display:flex;}
 .mobile-nav-btn{padding:11px 14px;border-radius:8px;border:none;background:transparent;color:var(--muted);font-size:.95rem;font-weight:600;cursor:pointer;text-align:left;transition:all .2s;}
 .mobile-nav-btn:hover,.mobile-nav-btn.active{color:#fff;background:rgba(255,45,45,0.13);}
+.mobile-nav-btn.admin-btn{
+  text-decoration:none;display:flex;align-items:center;gap:8px;margin-top:4px;
+  background:linear-gradient(135deg,rgba(255,45,45,.16),rgba(255,107,53,.10));
+  border:1px solid rgba(255,45,45,.3);
+}
 
 /* ── PAGES ── */
 .page{display:none;}
@@ -73,6 +84,14 @@ nav{
   font-size:.97rem;color:var(--muted);
   max-width:420px;margin:0 auto 36px;line-height:1.6;position:relative;
 }
+.platform-note{
+  display:inline-flex;align-items:center;gap:7px;
+  margin:-18px auto 22px;padding:6px 12px;border-radius:20px;
+  color:#d8d8ec;background:rgba(255,255,255,0.055);
+  border:1px solid var(--border);font-size:.72rem;font-weight:700;
+  position:relative;
+}
+.platform-note b{color:#ff6b6b;}
 
 /* ── SEARCH BAR ── */
 .search-wrap{
@@ -279,6 +298,19 @@ nav{
 }
 .dl-btn-a:hover{background:rgba(0,230,118,0.22);}
 
+/* ── DOWNLOAD BUTTON LOADING STATE ── */
+.dl-btn.dl-loading,.dl-btn-a.dl-loading{
+  opacity:.6;pointer-events:none;justify-content:center;
+}
+.dl-spinner{
+  display:inline-block;width:14px;height:14px;
+  border:2px solid rgba(255,255,255,.35);
+  border-top-color:#fff;border-radius:50%;
+  animation:dlspin .7s linear infinite;flex-shrink:0;
+}
+.dl-btn-a.dl-loading .dl-spinner{border-color:rgba(0,230,118,.3);border-top-color:var(--green);}
+@keyframes dlspin{to{transform:rotate(360deg);}}
+
 /* ── AUDIO FORMATS ── */
 .afmt-row{
   background:rgba(255,255,255,0.03);border:1px solid var(--border);
@@ -451,12 +483,13 @@ footer strong{color:var(--text);}
         </linearGradient>
       </defs>
     </svg>
-    YT Downloader
+    Media Downloader
   </div>
 
   <div class="nav-links">
     <button class="nav-btn active" onclick="showPage('home',this)">Home</button>
     <button class="nav-btn" onclick="showPage('docs',this)">API Docs</button>
+    <a class="nav-btn admin-btn" href="/admin">👑 Admin</a>
   </div>
 
   <button class="hamburger" onclick="toggleMenu()">
@@ -467,14 +500,16 @@ footer strong{color:var(--text);}
 <div class="mobile-menu" id="mobileMenu">
   <button class="mobile-nav-btn active" onclick="showPage('home',this,true)">Home</button>
   <button class="mobile-nav-btn" onclick="showPage('docs',this,true)">API Docs</button>
+  <a class="mobile-nav-btn admin-btn" href="/admin">👑 Admin Panel</a>
 </div>
 
 <!-- ════ HOME PAGE ════ -->
 <div class="page active" id="page-home">
 
   <div class="hero">
-    <h1>Download YouTube<br/><em>Videos &amp; Audio</em></h1>
-    <p>Search any video, choose quality — download with audio, no mute.</p>
+    <h1>Download YouTube &amp; TikTok<br/><em>Videos &amp; Audio</em></h1>
+    <p>Search YouTube or paste a YouTube/TikTok link — download quickly with audio.</p>
+    <div class="platform-note"><b>Supports</b> YouTube videos · TikTok videos · TikTok audio</div>
 
     <!-- Search -->
     <div class="search-wrap">
@@ -491,7 +526,7 @@ footer strong{color:var(--text);}
     <div class="url-divider">or paste a link</div>
 
     <div class="url-row">
-      <input type="text" id="directUrl" placeholder="https://youtu.be/…"/>
+      <input type="text" id="directUrl" placeholder="Paste YouTube or TikTok link…"/>
       <button onclick="loadDirect()">Load</button>
     </div>
   </div>
@@ -508,7 +543,7 @@ footer strong{color:var(--text);}
 
   <div class="docs-hero">
     <h2>API <em>Documentation</em></h2>
-    <p>Three clean endpoints. All responses are JSON. Use them in bots, scripts, or apps.</p>
+    <p>YouTube and TikTok download endpoints. Use them in bots, scripts, or apps.</p>
   </div>
 
   <!-- Base URL -->
@@ -635,6 +670,67 @@ footer strong{color:var(--text);}
     </div>
   </div>
 
+  <!-- ── GET /download/tiktok ── -->
+  <div class="ep-card">
+    <div class="ep-head">
+      <span class="method get">GET</span>
+      <span class="ep-path">/download/tiktok?url={tiktok_url}</span>
+      <span class="ep-tag">TikTok</span>
+    </div>
+    <div class="ep-body">
+      <h4>Query Parameter</h4>
+      <table class="ptable">
+        <tr><th>Param</th><th>Type</th><th>Required</th><th>Description</th></tr>
+        <tr><td class="pname">url</td><td>string</td><td><span class="preq">Yes</span></td><td>Full TikTok URL, including www, vm, or vt links</td></tr>
+      </table>
+      <h4>Example Request</h4>
+      <div class="codeblock">GET /download/tiktok?url=https://www.tiktok.com/@creator/video/123456789</div>
+      <br/>
+      <h4>Response</h4>
+      <div class="codeblock">{
+  <span class="s">"status"</span>: <span class="s">"ok"</span>,
+  <span class="s">"platform"</span>: <span class="s">"tiktok"</span>,
+  <span class="s">"formats"</span>: {
+    <span class="s">"video_audio"</span>: [<span class="c">/* no-watermark MP4 */</span>],
+    <span class="s">"audio_only"</span>: [<span class="c">/* original sound MP3 */</span>]
+  }
+}</div>
+      <div class="tip">
+        <strong>Website:</strong> Paste any TikTok link in the home page input. The site shows a no-watermark video and original audio download.
+      </div>
+    </div>
+  </div>
+
+  <!-- ── GET /download/pinterest ── -->
+  <div class="ep-card">
+    <div class="ep-head">
+      <span class="method get">GET</span>
+      <span class="ep-path">/download/pinterest?url={pinterest_url}</span>
+      <span class="ep-tag">Pinterest</span>
+    </div>
+    <div class="ep-body">
+      <h4>Query Parameter</h4>
+      <table class="ptable">
+        <tr><th>Param</th><th>Type</th><th>Required</th><th>Description</th></tr>
+        <tr><td class="pname">url</td><td>string</td><td><span class="preq">Yes</span></td><td>Full Pinterest URL, including pin.it short links</td></tr>
+      </table>
+      <h4>Example Request</h4>
+      <div class="codeblock">GET /download/pinterest?url=https://pin.it/1XtzdYaOq</div>
+      <br/>
+      <h4>Response</h4>
+      <div class="codeblock">{
+  <span class="s">"status"</span>: <span class="s">"ok"</span>,
+  <span class="s">"platform"</span>: <span class="s">"pinterest"</span>,
+  <span class="s">"formats"</span>: {
+    <span class="s">"video_audio"</span>: [<span class="c">/* Pinterest video MP4 */</span>]
+  }
+}</div>
+      <div class="tip">
+        <strong>Website:</strong> Paste any Pinterest link in the home page input. The site shows a Pinterest video download.
+      </div>
+    </div>
+  </div>
+
   <!-- ── Live Test ── -->
   <div class="ep-card">
     <div class="ep-head">
@@ -642,7 +738,7 @@ footer strong{color:var(--text);}
     </div>
     <div class="ep-body">
       <div class="test-row">
-        <input type="text" id="testUrl" placeholder="Paste a YouTube URL to test…"/>
+        <input type="text" id="testUrl" placeholder="Paste a YouTube, TikTok or Pinterest URL to test…"/>
         <button class="tbtn-a" onclick="testApi('audio')">Test Audio</button>
         <button class="tbtn-v" onclick="testApi('video')">Test Video</button>
       </div>
@@ -721,6 +817,12 @@ function loadDirect(){
   if(!u)return;
   openVideo(u);
 }
+function isTikTokUrl(url){
+  return /(^|\/\/)(www\.|m\.|vm\.|vt\.)?tiktok\.com(?:\/|$)/i.test(url.trim());
+}
+function isPinterestUrl(url){
+  return /(^|\/\/)((www\.|[a-z-]+\.)?pinterest\.com|pin\.it|.*pinimg\.com)(?:\/|$)/i.test(url.trim());
+}
 function setLoader(s){document.getElementById('loader').style.display=s?'block':'none';}
 function setSL(t){document.getElementById('sectionLabel').textContent=t;}
 
@@ -761,7 +863,84 @@ function closeModal(){document.getElementById('overlay').classList.remove('open'
 function closeBg(e){if(e.target===document.getElementById('overlay'))closeModal();}
 function setMC(h){document.getElementById('mc').innerHTML=h;}
 function spinHtml(c){
-  return`<div class="modal-spin"><div class="spin" style="border-top-color:${c}"></div><br/>Fetching…</div>`;
+  return`<div class="modal-spin"><div class="spin" style="border-top-color:${c}"></div><br/>Loading available qualities…</div>`;
+}
+
+// ── TIKTOK MODAL ────────────────────────────────────────
+function openTikTok(url){
+  openModal();
+  setMC(spinHtml('#ff6b6b'));
+  fetch('/download/tiktok?url='+encodeURIComponent(url))
+    .then(r=>r.json())
+    .then(d=>{
+      if(d.status!=='ok'){
+        setMC(`<div class="err-box">❌ ${esc(d.error||'TikTok video could not be loaded')}</div>`);
+        return;
+      }
+      const video=(d.formats&&d.formats.video_audio||[])[0];
+      const audio=(d.formats&&d.formats.audio_only||[])[0];
+      const videoHtml=video?`
+        <div class="qrow">
+          <div class="qbadge"><div class="qres">HD</div><div class="qfps">MP4</div></div>
+          <div class="qinfo"><div class="ql">TikTok · No watermark · Video + Audio · ${esc(video.filesize_human||'')}</div></div>
+          <a class="dl-btn" href="${esc(video.download_url)}" download>⬇ Download</a>
+        </div>`:'';
+      const audioHtml=audio?`
+        <div class="afmt-row">
+          <div class="afmt-info">
+            <div class="afmt-top"><span class="abadge">Audio</span>Original Sound</div>
+            <div class="afmt-detail">MP3 · ${esc(audio.filesize_human||'')}</div>
+          </div>
+          <a class="dl-btn-a" href="${esc(audio.download_url)}" download>⬇ Download</a>
+        </div>`:'';
+      if(!videoHtml&&!audioHtml){
+        setMC(`<div class="err-box">❌ No downloadable TikTok media was found.</div>`);
+        return;
+      }
+      setMC(`
+        <img class="modal-thumb" src="${esc(d.thumbnail||'')}" onerror="this.style.display='none'"/>
+        <div class="modal-title">${esc(d.title||'TikTok video')}</div>
+        <div class="modal-meta"><span style="color:#ff6b6b;font-weight:700;">TikTok</span> · ${esc(d.channel||'')} · ${esc(d.duration||'')}</div>
+        <div class="ftabs"><button class="ftab active">Downloads</button></div>
+        <div class="fpanel active" style="display:flex;flex-direction:column;gap:7px;">
+          ${videoHtml}${audioHtml}
+        </div>
+      `);
+    })
+    .catch(e=>setMC(`<div class="err-box">❌ ${esc(e.message)}</div>`));
+}
+
+// ── PINTEREST MODAL ────────────────────────────────────
+function openPinterest(url){
+  openModal();
+  setMC(spinHtml('#e60023'));
+  fetch('/download/pinterest?url='+encodeURIComponent(url))
+    .then(r=>r.json())
+    .then(d=>{
+      if(d.status!=='ok'){
+        setMC(`<div class="err-box">❌ ${esc(d.error||'Pinterest video could not be loaded')}</div>`);
+        return;
+      }
+      const video=(d.formats&&d.formats.video_audio||[])[0];
+      if(!video||!video.download_url){
+        setMC(`<div class="err-box">❌ No downloadable Pinterest video was found.</div>`);
+        return;
+      }
+      setMC(`
+        <img class="modal-thumb" src="${esc(d.thumbnail||'')}" onerror="this.style.display='none'"/>
+        <div class="modal-title">${esc(d.title||'Pinterest video')}</div>
+        <div class="modal-meta"><span style="color:#e60023;font-weight:700;">Pinterest</span> · ${esc(d.channel||'')}</div>
+        <div class="ftabs"><button class="ftab active">Downloads</button></div>
+        <div class="fpanel active" style="display:flex;flex-direction:column;gap:7px;">
+          <div class="qrow">
+            <div class="qbadge"><div class="qres">Video</div><div class="qfps">MP4</div></div>
+            <div class="qinfo"><div class="ql">Pinterest · Video + Audio</div></div>
+            <a class="dl-btn" href="${esc(video.download_url)}" download>⬇ Download</a>
+          </div>
+        </div>
+      `);
+    })
+    .catch(e=>setMC(`<div class="err-box">❌ ${esc(e.message)}</div>`));
 }
 
 // ── AUDIO MODAL ────────────────────────────────────────
@@ -772,6 +951,7 @@ function openAudio(url){
     .then(r=>r.json())
     .then(d=>{
       if(d.status==='error'){setMC(`<div class="err-box">❌ ${esc(d.error)}</div>`);return;}
+      if(!d.best_audio){setMC(`<div class="err-box">❌ No audio formats were found for this video.</div>`);return;}
       const b=d.best_audio;
       const all=d.all_audio_formats||[];
       let rows='';
@@ -782,7 +962,7 @@ function openAudio(url){
             <div class="afmt-top"><span class="abadge">Audio</span>${esc(f.abr?f.abr+' kbps':'—')}</div>
             <div class="afmt-detail">${esc(det)}</div>
           </div>
-          <a class="dl-btn-a" href="${f.url}" target="_blank">⬇ Download</a>
+          <a class="dl-btn-a" href="${f.url}" download>⬇ Download</a>
         </div>`;
       });
       setMC(`
@@ -797,7 +977,7 @@ function openAudio(url){
             <div class="astat"><label>Bitrate</label><span>${b.abr?b.abr+' kbps':'—'}</span></div>
             <div class="astat"><label>Size</label><span>${b.filesize_human||'—'}</span></div>
           </div>
-          <a class="dl-btn" href="${b.url}" target="_blank" style="width:100%;justify-content:center;">⬇ Download Best Audio (.${b.ext})</a>
+         <a class="dl-btn" href="${b.url}" download style="width:100%;justify-content:center;">⬇ Download Best Audio (.${b.ext})</a>
         </div>
         ${all.length>1?`<div style="font-size:.75rem;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin:14px 0 9px;">All Formats</div><div style="display:flex;flex-direction:column;gap:6px;">${rows}</div>`:''}
       `);
@@ -807,15 +987,25 @@ function openAudio(url){
 
 // ── VIDEO MODAL ────────────────────────────────────────
 function openVideo(url){
+  if(isTikTokUrl(url)){
+    openTikTok(url);
+    return;
+  }
+  if(isPinterestUrl(url)){
+    openPinterest(url);
+    return;
+  }
   openModal();
   setMC(spinHtml('var(--red)'));
   fetch('/download/video?url='+encodeURIComponent(url))
     .then(r=>r.json())
     .then(d=>{
       if(d.status==='error'){setMC(`<div class="err-box">❌ ${esc(d.error)}</div>`);return;}
+      const merged=(d.formats&&d.formats.video_audio)||[];
       const combined=(d.formats&&d.formats.combined)||[];
       const vonly=(d.formats&&d.formats.video_only)||[];
       const aonly=(d.formats&&d.formats.audio_only)||[];
+      const avFormats=merged.length?merged:combined;
 
       function fmtRow(f,badge){
         const label=badge==='Video+Audio'?(f.height?(f.height>=1080?'Full HD':f.height>=720?'HD':f.height>=480?'SD':'Low'):''):'';
@@ -823,7 +1013,8 @@ function openVideo(url){
                    f.vcodec&&f.vcodec!=='none'?f.vcodec.split('.')[0]:null,
                    f.acodec&&f.acodec!=='none'?f.acodec.split('.')[0]:null,
                    f.abr?f.abr+' kbps':null, f.filesize_human].filter(Boolean).join(' · ');
-        return`<div class="qrow">
+         const downloadUrl=f.download_url||f.url;
+         return`<div class="qrow">
           <div class="qbadge">
             <div class="qres">${f.height?f.height+'p':(f.ext||'').toUpperCase()}</div>
             <div class="qfps">${f.fps?f.fps+'fps':f.abr?f.abr+'kbps':''}</div>
@@ -831,18 +1022,18 @@ function openVideo(url){
           <div class="qinfo">
             <div class="ql">${esc(label||badge)} · ${esc(det)}</div>
           </div>
-          <a class="dl-btn" href="${f.url}" target="_blank">⬇ Download</a>
+            <a class="dl-btn" href="${esc(downloadUrl)}" download>⬇ Download</a>
         </div>`;
       }
 
-      let cHtml=combined.map(f=>fmtRow(f,'Video+Audio')).join('');
+      let cHtml=avFormats.map(f=>fmtRow(f,'Video+Audio')).join('');
       let vHtml=vonly.map(f=>fmtRow(f,'Video Only')).join('');
       let aHtml=aonly.map(f=>fmtRow(f,'Audio Only')).join('');
 
       const tabs=`<div class="ftabs">
-        ${combined.length?`<button class="ftab active" onclick="switchTab(this,'tv')">Video+Audio<span class="fcnt">${combined.length}</span></button>`:''}
-        ${vonly.length?`<button class="ftab${!combined.length?' active':''}" onclick="switchTab(this,'tvonly')">Video Only<span class="fcnt">${vonly.length}</span></button>`:''}
-        ${aonly.length?`<button class="ftab${!combined.length&&!vonly.length?' active':''}" onclick="switchTab(this,'ta')">Audio Only<span class="fcnt">${aonly.length}</span></button>`:''}
+        ${avFormats.length?`<button class="ftab active" onclick="switchTab(this,'tv')">Video+Audio<span class="fcnt">${avFormats.length}</span></button>`:''}
+        ${vonly.length?`<button class="ftab${!avFormats.length?' active':''}" onclick="switchTab(this,'tvonly')">Video Only<span class="fcnt">${vonly.length}</span></button>`:''}
+        ${aonly.length?`<button class="ftab${!avFormats.length&&!vonly.length?' active':''}" onclick="switchTab(this,'ta')">Audio Only<span class="fcnt">${aonly.length}</span></button>`:''}
       </div>`;
 
       setMC(`
@@ -850,9 +1041,9 @@ function openVideo(url){
         <div class="modal-title">${esc(d.title)}</div>
         <div class="modal-meta">${esc(d.channel||'')} · ${d.duration}</div>
         ${tabs}
-        ${combined.length?`<div class="fpanel active" id="tv"><div style="display:flex;flex-direction:column;gap:7px;">${cHtml}</div></div>`:''}
-        ${vonly.length?`<div class="fpanel${!combined.length?' active':''}" id="tvonly"><div style="display:flex;flex-direction:column;gap:7px;">${vHtml}</div></div>`:''}
-        ${aonly.length?`<div class="fpanel${!combined.length&&!vonly.length?' active':''}" id="ta"><div style="display:flex;flex-direction:column;gap:6px;">${aHtml}</div></div>`:''}
+        ${avFormats.length?`<div class="fpanel active" id="tv"><div style="display:flex;flex-direction:column;gap:7px;">${cHtml}</div></div>`:''}
+        ${vonly.length?`<div class="fpanel${!avFormats.length?' active':''}" id="tvonly"><div style="display:flex;flex-direction:column;gap:7px;">${vHtml}</div></div>`:''}
+        ${aonly.length?`<div class="fpanel${!avFormats.length&&!vonly.length?' active':''}" id="ta"><div style="display:flex;flex-direction:column;gap:6px;">${aHtml}</div></div>`:''}
       `);
     })
     .catch(e=>setMC(`<div class="err-box">❌ ${e.message}</div>`));
@@ -880,6 +1071,34 @@ function testApi(type){
   out.textContent='Loading…';
   fetch(path).then(r=>r.json()).then(d=>{out.textContent=JSON.stringify(d,null,2);}).catch(e=>{out.textContent='Error: '+e.message;});
 }
+
+// ── DOWNLOAD BUTTON FEEDBACK ────────────────────────────
+// Real download links start preparing on the server (ffmpeg merge /
+// nexray backup), which always has a delay. Show an immediate spinner so
+// the user knows the button was clicked.
+document.addEventListener('click',function(e){
+  const a=e.target.closest&&e.target.closest('a.dl-btn,a.dl-btn-a');
+  if(!a||!a.hasAttribute('download')||!a.getAttribute('href'))return;
+  if(a.classList.contains('dl-loading'))return;
+
+  e.preventDefault();
+  const original=a.innerHTML;
+  a.classList.add('dl-loading');
+  a.innerHTML='<span class="dl-spinner"></span> Preparing…';
+
+  setTimeout(function(){
+    const t=document.createElement('a');
+    t.href=a.href;
+    t.download=a.getAttribute('download')||'';
+    document.body.appendChild(t);
+    t.click();
+    t.remove();
+    setTimeout(function(){
+      a.classList.remove('dl-loading');
+      a.innerHTML=original;
+    },15000);
+  },60);
+});
 </script>
 </body>
 </html>
