@@ -2275,6 +2275,35 @@ def cookie_status():
     })
 
 
+@app.route("/version")
+def version_status():
+    """Diagnostic: which commit/version is deployed (for Render debugging)."""
+    version_raw = "unknown"
+    try:
+        version_file = os.path.join(_BASE_DIR, "VERSION")
+        if os.path.isfile(version_file):
+            with open(version_file) as f:
+                version_raw = f.read().strip()
+    except Exception:
+        pass
+    try:
+        ytdlp_ver = yt_dlp.version.__version__
+    except Exception:
+        ytdlp_ver = getattr(yt_dlp, "__version__", "unknown")
+    try:
+        sys_ver = __import__("sys").version.split()[0]
+    except Exception:
+        sys_ver = "unknown"
+    return jsonify({
+        "version": version_raw,
+        "yt_dlp": ytdlp_ver,
+        "extract_timeout": _EXTRACT_TIMEOUT_SECONDS,
+        "extract_budget": _EXTRACT_BUDGET_SECONDS,
+        "fallback_clients": _FALLBACK_PLAYER_CLIENTS,
+        "python": sys_ver,
+    })
+
+
 @app.route("/search")
 def search():
     query = request.args.get("q", "").strip()
