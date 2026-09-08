@@ -1528,7 +1528,7 @@ def _download_stream_via_ytdl(youtube_url, format_spec, suffix="mp4", merge_outp
 
     assigned = _cookie_pool.get_next()
     cookie_candidates = [assigned] if assigned else []
-    clients = ["default"] + [c for c in _FALLBACK_PLAYER_CLIENTS if c != "default"]
+    clients = list(_FALLBACK_PLAYER_CLIENTS) + ["default"]
 
     for cookie in cookie_candidates + [None]:
         for client in clients:
@@ -1549,12 +1549,16 @@ def _download_stream_via_ytdl(youtube_url, format_spec, suffix="mp4", merge_outp
 
 def extract_info(url):
     """
-    Extract info with smart fallback strategy:
+    Extract info with smart fallback strategy (datacenter-IP friendly).
+    Datacenter IPs (Replit/Render) are bot-flagged on YouTube's default web
+    client and cross-IP cookies often trip the "Sign in to confirm you're not
+    a bot" session check, so we try the app clients WITHOUT cookies first.
 
-    Round 1 — assigned cookie + every fallback player client (default first)
-    Round 2 — other cookies with the same client list (only on block errors)
-    Round 3 — each remaining client WITHOUT cookies (n-challenge / 403 bypass)
-    Round 4 — each remaining client WITH each cookie (final attempt)
+    Round 1 — bypass player clients (mediaconnect/tv/android/ios/web_safari/mweb)
+               WITHOUT cookies — dodge the n-challenge, work from datacenter IPs
+    Round 2 — assigned cookie + every player client
+    Round 3 — other cookies with the same client list (only on block errors)
+    Round 4 — default web client WITHOUT cookie (last resort)
     """
     now = time.monotonic()
     with _info_cache_lock:
@@ -1577,7 +1581,8 @@ def extract_info(url):
 
     assigned  = _cookie_pool.get_next()
     others    = [c for c in _cookie_pool._load_cookies() if c != assigned]
-    clients   = ["default"] + [c for c in _FALLBACK_PLAYER_CLIENTS if c != "default"]
+    bypass    = list(_FALLBACK_PLAYER_CLIENTS)
+    all_clients = bypass + ["default"]
     last_exc  = None
     is_block  = False
     budget_start = time.monotonic()
@@ -1599,13 +1604,13 @@ def extract_info(url):
     def _in_budget():
         return (time.monotonic() - budget_start) < _EXTRACT_BUDGET_SECONDS
 
-    # ── Round 1: assigned cookie, walk through all player clients ─────
-    for client in clients:
+    # ── Round 1: bypass clients WITHOUT cookies (datacenter-IP friendly) ──
+    for client in bypass:
         if not _in_budget():
             break
-        info = _try(get_ydl_opts(assigned, player_client=client))
+        info = _try(get_ydl_opts(player_client=client))
         if info is not None:
-            print(f"[YDL] OK cookie={os.path.basename(assigned)} client={client}")
+            print(f"[YDL] OK no-cookie client={client}")
             return cache_and_return(info)
 
     # A definitive "video is unavailable / private / removed" is per-video
@@ -1621,12 +1626,21 @@ def extract_info(url):
                 return cache_and_return(info)
         raise last_exc
 
-    # ── Round 2: other cookies (only after a block error) ──────────────
+    # ── Round 2: assigned cookie, walk through all player clients ─────
+    for client in all_clients:
+        if not _in_budget():
+            break
+        info = _try(get_ydl_opts(assigned, player_client=client))
+        if info is not None:
+            print(f"[YDL] OK cookie={os.path.basename(assigned)} client={client}")
+            return cache_and_return(info)
+
+    # ── Round 3: other cookies (only after a block error) ──────────────
     if is_block:
         for c in others:
             if not _in_budget():
                 break
-            for client in clients:
+            for client in all_clients:
                 info = _try(get_ydl_opts(c, player_client=client))
                 if info is not None:
                     print(f"[YDL] OK cookie fallback={os.path.basename(c)} client={client}")
@@ -1634,26 +1648,12 @@ def extract_info(url):
             if is_block:
                 _cookie_pool.mark_blocked(c)
 
-    # ── Round 3: remaining clients WITHOUT cookie (bypasses n-challenge) ──
+    # ── Round 4: default web client WITHOUT cookie (last resort) ────────
     if _in_budget():
-        for client in clients:
-            if not _in_budget():
-                break
-            info = _try(get_ydl_opts(player_client=client))
-            if info is not None:
-                print(f"[YDL] OK no-cookie client={client}")
-                return cache_and_return(info)
-
-    # ── Round 4: remaining clients WITH each cookie (final attempt) ────
-    if _in_budget():
-        for c in ([assigned] if assigned else []) + others:
-            if not _in_budget():
-                break
-            for client in clients:
-                info = _try(get_ydl_opts(c, player_client=client))
-                if info is not None:
-                    print(f"[YDL] OK cookie={os.path.basename(c)} client={client}")
-                    return cache_and_return(info)
+        info = _try(get_ydl_opts(player_client="default"))
+        if info is not None:
+            print("[YDL] OK default client no-cookie")
+            return cache_and_return(info)
 
     raise last_exc
 
@@ -2309,7 +2309,7 @@ def search():
     assigned = _cookie_pool.get_next()
     info = None
     last_exc = None
-    clients = ["default"] + [c for c in _FALLBACK_PLAYER_CLIENTS if c != "default"]
+    clients = list(_FALLBACK_PLAYER_CLIENTS) + ["default"]
     is_block = False
     budget_start = time.monotonic()
 
