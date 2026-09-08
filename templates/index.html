@@ -766,6 +766,14 @@ footer strong{color:var(--text);}
 
 <script>
 // ── UTILS ──────────────────────────────────────────────
+// fetchJSON: abort after FUT (ms) so modals can't spin forever.
+var API_TIMEOUT=75000;
+function fetchJSON(path,timeout){
+  timeout=timeout||API_TIMEOUT;
+  const ctl=new AbortController();
+  const t=setTimeout(()=>ctl.abort(),timeout);
+  return fetch(path,{signal:ctl.signal}).then(r=>r.json()).finally(()=>clearTimeout(t));
+}
 function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
 function ea(s){return String(s||'').replace(/'/g,"\\'");}
 function fmtViews(n){
@@ -802,15 +810,14 @@ function doSearch(){
   setLoader(true);
   document.getElementById('grid').innerHTML='';
   document.getElementById('sectionLabel').textContent='';
-  fetch('/search?q='+encodeURIComponent(q))
-    .then(r=>r.json())
+  fetchJSON('/search?q='+encodeURIComponent(q))
     .then(d=>{
       setLoader(false);
       if(d.error){setSL('Error: '+d.error);return;}
       setSL(d.results.length+' results for "'+q+'"');
       renderCards(d.results);
     })
-    .catch(e=>{setLoader(false);setSL('Failed: '+e.message);});
+    .catch(e=>{setLoader(false);setSL('Failed: '+(e.name==='AbortError'?'Timed out after '+(API_TIMEOUT/1000)+'s':e.message));});
 }
 function loadDirect(){
   const u=document.getElementById('directUrl').value.trim();
@@ -870,8 +877,7 @@ function spinHtml(c){
 function openTikTok(url){
   openModal();
   setMC(spinHtml('#ff6b6b'));
-  fetch('/download/tiktok?url='+encodeURIComponent(url))
-    .then(r=>r.json())
+  fetchJSON('/download/tiktok?url='+encodeURIComponent(url))
     .then(d=>{
       if(d.status!=='ok'){
         setMC(`<div class="err-box">❌ ${esc(d.error||'TikTok video could not be loaded')}</div>`);
@@ -907,15 +913,14 @@ function openTikTok(url){
         </div>
       `);
     })
-    .catch(e=>setMC(`<div class="err-box">❌ ${esc(e.message)}</div>`));
+    .catch(e=>setMC(`<div class="err-box">❌ ${esc(e.name==='AbortError'?'Timed out — try again in a moment.':e.message)}</div>`));
 }
 
 // ── PINTEREST MODAL ────────────────────────────────────
 function openPinterest(url){
   openModal();
   setMC(spinHtml('#e60023'));
-  fetch('/download/pinterest?url='+encodeURIComponent(url))
-    .then(r=>r.json())
+  fetchJSON('/download/pinterest?url='+encodeURIComponent(url))
     .then(d=>{
       if(d.status!=='ok'){
         setMC(`<div class="err-box">❌ ${esc(d.error||'Pinterest video could not be loaded')}</div>`);
@@ -940,18 +945,23 @@ function openPinterest(url){
         </div>
       `);
     })
-    .catch(e=>setMC(`<div class="err-box">❌ ${esc(e.message)}</div>`));
+    .catch(e=>setMC(`<div class="err-box">❌ ${esc(e.name==='AbortError'?'Timed out — try again in a moment.':e.message)}</div>`));
 }
 
 // ── AUDIO MODAL ────────────────────────────────────────
 function openAudio(url){
   openModal();
   setMC(spinHtml('var(--green)'));
-  fetch('/download/audio?url='+encodeURIComponent(url))
-    .then(r=>r.json())
+  fetchJSON('/download/audio?url='+encodeURIComponent(url))
     .then(d=>{
       if(d.status==='error'){setMC(`<div class="err-box">❌ ${esc(d.error)}</div>`);return;}
-      if(!d.best_audio){setMC(`<div class="err-box">❌ No audio formats were found for this video.</div>`);return;}
+      if(!d.best_audio){
+        if(d.backup){
+          setMC(`<div class="err-box">❌ yt-dlp is blocked on this server.<br/><a class="dl-btn" style="margin-top:10px;width:100%;justify-content:center;" href="/api/nexray?url=${esc(d._backup_url||'')}&quality=128">⬇ Download via Backup API (.mp3)</a></div>`);
+          return;
+        }
+        setMC(`<div class="err-box">❌ No audio formats were found for this video.</div>`);return;
+      }
       const b=d.best_audio;
       const all=d.all_audio_formats||[];
       let rows='';
@@ -997,8 +1007,7 @@ function openVideo(url){
   }
   openModal();
   setMC(spinHtml('var(--red)'));
-  fetch('/download/video?url='+encodeURIComponent(url))
-    .then(r=>r.json())
+  fetchJSON('/download/video?url='+encodeURIComponent(url))
     .then(d=>{
       if(d.status==='error'){setMC(`<div class="err-box">❌ ${esc(d.error)}</div>`);return;}
       const merged=(d.formats&&d.formats.video_audio)||[];
@@ -1046,7 +1055,7 @@ function openVideo(url){
         ${aonly.length?`<div class="fpanel${!avFormats.length&&!vonly.length?' active':''}" id="ta"><div style="display:flex;flex-direction:column;gap:6px;">${aHtml}</div></div>`:''}
       `);
     })
-    .catch(e=>setMC(`<div class="err-box">❌ ${e.message}</div>`));
+    .catch(e=>setMC(`<div class="err-box">❌ ${e.name==='AbortError'?'Timed out after '+(API_TIMEOUT/1000)+'s — YouTube is slow or blocking this server. Try again or use a different video.':e.message}</div>`));
 }
 
 function switchTab(btn,pid){
@@ -1069,7 +1078,7 @@ function testApi(type){
   const out=document.getElementById('testOutput');
   document.getElementById('testResult').style.display='block';
   out.textContent='Loading…';
-  fetch(path).then(r=>r.json()).then(d=>{out.textContent=JSON.stringify(d,null,2);}).catch(e=>{out.textContent='Error: '+e.message;});
+  fetchJSON(path).then(d=>{out.textContent=JSON.stringify(d,null,2);}).catch(e=>{out.textContent='Error: '+(e.name==='AbortError'?'Timed out after '+(API_TIMEOUT/1000)+'s':e.message);});
 }
 
 // ── DOWNLOAD BUTTON FEEDBACK ────────────────────────────

@@ -29,8 +29,18 @@ _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/120.0.0.0 Safari/537.36"
+    "Chrome/131.0.0.0 Safari/537.36"
 )
+
+# Overall hard cap for a single yt-dlp extraction (seconds).
+# Prevents infinite "loading" on hosting like Replit when YouTube stalls.
+_EXTRACT_TIMEOUT_SECONDS = 20
+# Maximum total time spent across ALL fallback attempts for one URL.
+# With 7 clients + up to 5 cookies this bounds worst-case hang (~90s).
+_EXTRACT_BUDGET_SECONDS = 90
+# Clients tried in order when YouTube blocks the default web client (403 / bot).
+# mediaconnect + tv/android/ios/web_safari dodge the n-challenge most of the time.
+_FALLBACK_PLAYER_CLIENTS = ["mediaconnect", "tv", "android", "ios", "web_safari", "mweb"]
 
 # ══════════════════════════════════════════════════════
 #  COOKIE ROTATION SYSTEM
@@ -1355,12 +1365,14 @@ def _proxy_facebook_media(media_url, filename, content_type):
 
 
 def _is_cookie_error(exc):
-    """Detect if an exception is caused by YouTube bot/cookie block."""
+    """Detect if an exception is caused by YouTube bot/IP/cookie block."""
     msg = str(exc).lower()
     return any(k in msg for k in [
         "sign in", "signin", "bot", "429", "too many requests",
-        "confirm you're not a bot", "this video is unavailable",
+        "confirm you're not a bot",
         "blocked", "cookie", "captcha", "please sign in",
+        "forbidden", "403", "unable to download api page",
+        "api page", "http error",
     ])
 
 
@@ -1370,6 +1382,20 @@ def _is_nsig_error(exc):
     return any(k in msg for k in [
         "signature solving failed", "n challenge", "requested format is not available",
         "only images are available",
+    ])
+
+
+def _is_definitive_unavailable(exc):
+    """Detect errors meaning the video itself is gone/private/geo-blocked.
+
+    These are per-video, not per-IP/cookie — retrying every client & cookie
+    would waste minutes. We still try one fallback client before bailing.
+    """
+    msg = str(exc).lower()
+    return any(k in msg for k in [
+        "this video is unavailable", "video unavailable",
+        "private video", "this video has been removed",
+        "unavailable for legal reasons", "removed",
     ])
 
 
@@ -1398,14 +1424,35 @@ def get_ydl_opts(cookie_path=None, player_client=None):
     if cookie_path and os.path.isfile(cookie_path):
         opts["cookiefile"] = cookie_path
     if player_client:
-        opts["extractor_args"] = {"youtube": {"player_client": [player_client]}}
+        clients = player_client if isinstance(player_client, (list, tuple)) else [player_client]
+        opts["extractor_args"] = {"youtube": {"player_client": clients}}
     return opts
 
 
-def _ydl_extract(opts, url):
-    """Run yt-dlp extract_info and raise if result has no real formats."""
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=False)
+def _ydl_extract(opts, url, timeout=None):
+    """Run yt-dlp extract_info under an overall timeout; raise if no real formats."""
+    timeout = timeout or _EXTRACT_TIMEOUT_SECONDS
+    result = {}
+
+    def _run():
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                result["info"] = ydl.extract_info(url, download=False)
+        except Exception as e:
+            result["error"] = e
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    thread.join(timeout=timeout)
+    if thread.is_alive():
+        raise RuntimeError(
+            f"Extraction timed out after {timeout}s "
+            "(YouTube is stalling or blocking this server IP)"
+        )
+    if "error" in result:
+        raise result["error"]
+
+    info = result["info"]
     # Reject storyboard-only results (no real video/audio)
     fmts = info.get("formats", [])
     real = [f for f in fmts if f.get("ext") not in ("mhtml", None) and f.get("url")]
@@ -1414,14 +1461,100 @@ def _ydl_extract(opts, url):
     return info
 
 
+def _ydl_download_file(url, format_spec, outtmpl, cookie_path=None, player_client=None, timeout=None, merge_output_format=None):
+    """
+    Download media via yt-dlp itself (carries cookies + client + POT context)
+    instead of handing a raw googlevideo URL to ffmpeg, which YouTube 403s.
+
+    outtmpl must contain %(ext)s. Returns the final local file path.
+    """
+    timeout = timeout or _EXTRACT_TIMEOUT_SECONDS
+    opts = get_ydl_opts(cookie_path, player_client)
+    opts.update({
+        "format":          format_spec,
+        "outtmpl":         outtmpl,
+        "skip_download":   False,
+        "noprogress":      True,
+        "quiet":           True,
+        "no_warnings":     True,
+        "overwrites":      True,
+        "retries":         2,
+        "fragment_retries": 2,
+        # Only merge when asked; otherwise save the raw stream for ffmpeg.
+        "merge_output_format": merge_output_format,
+    })
+    result = {}
+
+    def _run():
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                result["files"] = ydl.download([url])
+        except Exception as e:
+            result["error"] = e
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    thread.join(timeout=timeout)
+    if thread.is_alive():
+        raise RuntimeError(f"Download timed out after {timeout}s")
+    if "error" in result:
+        raise result["error"]
+    import glob
+    glob_pattern = outtmpl.replace("%(ext)s", "*")
+    outs = glob.glob(glob_pattern)
+    if not outs:
+        # Fall back to the literal.ext wildcard in case the template used a dot.
+        outs = glob.glob(outtmpl.replace("%(ext)s", ".*"))
+    for p in outs:
+        if os.path.isfile(p) and os.path.getsize(p) > 0:
+            return p
+    raise RuntimeError("yt-dlp produced no file")
+
+
+def _download_stream_via_ytdl(youtube_url, format_spec, suffix="mp4", merge_output_format=None):
+    """
+    Download ONE yt-dlp stream (by a format selector such as
+    'bestvideo[height<=720]+bestaudio' or 'bestaudio/best') into a temp file.
+    Uses yt-dlp itself so cookies / client / POT context are honored and
+    YouTube won't 403 the googlevideo URL.
+    Returns the local file path, or None after all attempts fail.
+    """
+    import tempfile, glob
+    if not format_spec:
+        return None
+    tmpdir = tempfile.mkdtemp(prefix="ytdl_")
+    base = os.path.join(tmpdir, "stream")
+    pattern = f"{base}.*"
+
+    assigned = _cookie_pool.get_next()
+    cookie_candidates = [assigned] if assigned else []
+    clients = ["default"] + [c for c in _FALLBACK_PLAYER_CLIENTS if c != "default"]
+
+    for cookie in cookie_candidates + [None]:
+        for client in clients:
+            try:
+                _ydl_download_file(
+                    youtube_url, format_spec, f"{base}.%(ext)s",
+                    cookie_path=cookie, player_client=client,
+                    merge_output_format=merge_output_format,
+                )
+                outs = glob.glob(pattern)
+                if outs:
+                    return outs[0]
+            except Exception as e:
+                print(f"[YDL-DL] fail spec={format_spec} client={client} cookie={bool(cookie)}: {str(e)[:120]}")
+                continue
+    return None
+
+
 def extract_info(url):
     """
     Extract info with smart fallback strategy:
 
-    Round 1 — assigned cookie + default player (handles age-gated content)
-    Round 2 — if n-challenge/sig fails: try all other cookies with default player
-    Round 3 — mediaconnect client without cookie (works when JS solving fails)
-    Round 4 — mediaconnect client with each cookie (final attempt)
+    Round 1 — assigned cookie + every fallback player client (default first)
+    Round 2 — other cookies with the same client list (only on block errors)
+    Round 3 — each remaining client WITHOUT cookies (n-challenge / 403 bypass)
+    Round 4 — each remaining client WITH each cookie (final attempt)
     """
     now = time.monotonic()
     with _info_cache_lock:
@@ -1444,53 +1577,83 @@ def extract_info(url):
 
     assigned  = _cookie_pool.get_next()
     others    = [c for c in _cookie_pool._load_cookies() if c != assigned]
+    clients   = ["default"] + [c for c in _FALLBACK_PLAYER_CLIENTS if c != "default"]
     last_exc  = None
-    is_cookie = False
-    is_nsig   = False
+    is_block  = False
+    budget_start = time.monotonic()
 
-    # ── Round 1: assigned cookie, default player ──────────────────────
-    try:
-        info = _ydl_extract(get_ydl_opts(assigned), url)
-        if assigned:
-            print(f"[YDL] OK cookie={os.path.basename(assigned)}")
-        return cache_and_return(info)
-    except Exception as e:
-        last_exc  = e
-        is_cookie = bool(assigned and _is_cookie_error(e))
-        is_nsig   = _is_nsig_error(e)
-        if not (is_cookie or is_nsig):
-            raise
-        if is_cookie:
-            _cookie_pool.mark_blocked(assigned)
+    def _remaining():
+        return max(1, _EXTRACT_BUDGET_SECONDS - (time.monotonic() - budget_start))
 
-    # ── Round 2: other cookies, default player (only on cookie error) ──
-    if is_cookie:
-        for c in others:
-            try:
-                info = _ydl_extract(get_ydl_opts(c), url)
-                print(f"[YDL] OK cookie fallback={os.path.basename(c)}")
-                return cache_and_return(info)
-            except Exception as e:
-                last_exc = e
-                if _is_cookie_error(e):
-                    _cookie_pool.mark_blocked(c)
-
-    # ── Round 3: mediaconnect without cookie (bypasses n-challenge) ───
-    try:
-        info = _ydl_extract(get_ydl_opts(player_client="mediaconnect"), url)
-        print("[YDL] OK mediaconnect no-cookie")
-        return cache_and_return(info)
-    except Exception as e:
-        last_exc = e
-
-    # ── Round 4: mediaconnect with each cookie ─────────────────────────
-    for c in ([assigned] if assigned else []) + others:
+    def _try(opts):
+        nonlocal last_exc, is_block
         try:
-            info = _ydl_extract(get_ydl_opts(c, player_client="mediaconnect"), url)
-            print(f"[YDL] OK mediaconnect cookie={os.path.basename(c)}")
-            return cache_and_return(info)
+            info = _ydl_extract(opts, url, timeout=min(_EXTRACT_TIMEOUT_SECONDS, _remaining()))
+            return info
         except Exception as e:
             last_exc = e
+            if _is_cookie_error(e) or _is_nsig_error(e):
+                is_block = True
+            return None
+
+    def _in_budget():
+        return (time.monotonic() - budget_start) < _EXTRACT_BUDGET_SECONDS
+
+    # ── Round 1: assigned cookie, walk through all player clients ─────
+    for client in clients:
+        if not _in_budget():
+            break
+        info = _try(get_ydl_opts(assigned, player_client=client))
+        if info is not None:
+            print(f"[YDL] OK cookie={os.path.basename(assigned)} client={client}")
+            return cache_and_return(info)
+
+    # A definitive "video is unavailable / private / removed" is per-video
+    # (not an IP/cookie issue). One quick no-cookie fallback client check,
+    # then bail — retrying the whole cookie×client matrix wastes minutes.
+    if last_exc and _is_definitive_unavailable(last_exc):
+        for client in ["mediaconnect", "tv"]:
+            if not _in_budget():
+                break
+            info = _try(get_ydl_opts(player_client=client))
+            if info is not None:
+                print(f"[YDL] OK unavailable-video fallback client={client}")
+                return cache_and_return(info)
+        raise last_exc
+
+    # ── Round 2: other cookies (only after a block error) ──────────────
+    if is_block:
+        for c in others:
+            if not _in_budget():
+                break
+            for client in clients:
+                info = _try(get_ydl_opts(c, player_client=client))
+                if info is not None:
+                    print(f"[YDL] OK cookie fallback={os.path.basename(c)} client={client}")
+                    return cache_and_return(info)
+            if is_block:
+                _cookie_pool.mark_blocked(c)
+
+    # ── Round 3: remaining clients WITHOUT cookie (bypasses n-challenge) ──
+    if _in_budget():
+        for client in clients:
+            if not _in_budget():
+                break
+            info = _try(get_ydl_opts(player_client=client))
+            if info is not None:
+                print(f"[YDL] OK no-cookie client={client}")
+                return cache_and_return(info)
+
+    # ── Round 4: remaining clients WITH each cookie (final attempt) ────
+    if _in_budget():
+        for c in ([assigned] if assigned else []) + others:
+            if not _in_budget():
+                break
+            for client in clients:
+                info = _try(get_ydl_opts(c, player_client=client))
+                if info is not None:
+                    print(f"[YDL] OK cookie={os.path.basename(c)} client={client}")
+                    return cache_and_return(info)
 
     raise last_exc
 
@@ -1703,15 +1866,34 @@ def _ffmpeg_stream_response(cmd, content_type, filename):
     )
 
 
-def _ffmpeg_merge_video_audio(video_url, audio_url, filename):
-    """Merge and normalize separate video + audio streams into a compatible MP4."""
+def _RE_ENCODE_VIDEO_CMD(video_path):
+    """Build an ffmpeg command that re-encodes video+audio to a WhatsApp-safe MP4."""
+    return [
+        "ffmpeg", "-y",
+        "-loglevel", "error",
+        "-i", video_path,
+        "-map", "0:v:0",
+        "-map", "0:a:0?",
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "23",
+        "-pix_fmt", "yuv420p",
+        "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2,setsar=1",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-ar", "48000",
+        "-movflags", "+faststart",
+        "-f", "mp4",
+    ]
+
+
+def _ffmpeg_merge_video_audio(video_path, audio_path, filename):
+    """Merge and normalize local video + audio files into a compatible MP4."""
     cmd = [
         "ffmpeg", "-y",
         "-loglevel", "error",
-        "-headers", _FFMPEG_HEADERS,
-        "-i", video_url,
-        "-headers", _FFMPEG_HEADERS,
-        "-i", audio_url,
+        "-i", video_path,
+        "-i", audio_path,
         "-map", "0:v:0",
         "-map", "1:a:0",
         "-c:v", "libx264",
@@ -1729,37 +1911,31 @@ def _ffmpeg_merge_video_audio(video_url, audio_url, filename):
     return _serve_tempfile(path, size, "video/mp4", filename)
 
 
-def _ffmpeg_combined_video(video_url, filename):
-    """Normalize a combined stream into a WhatsApp-compatible MP4."""
-    cmd = [
+def _ffmpeg_combined_video(video_path, filename):
+    """Fast-remux a combined stream to a WhatsApp-compatible MP4 (fallback: re-encode)."""
+    remux = [
         "ffmpeg", "-y",
         "-loglevel", "error",
-        "-headers", _FFMPEG_HEADERS,
-        "-i", video_url,
+        "-i", video_path,
         "-map", "0:v:0",
         "-map", "0:a:0?",
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-crf", "23",
-        "-pix_fmt", "yuv420p",
-        "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2,setsar=1",
-        "-c:a", "aac",
-        "-b:a", "128k",
-        "-ar", "48000",
+        "-c", "copy",
         "-movflags", "+faststart",
         "-f", "mp4",
     ]
-    path, size = _run_ffmpeg_to_tempfile(cmd, ".mp4")
+    try:
+        path, size = _run_ffmpeg_to_tempfile(remux, ".mp4")
+    except Exception:
+        path, size = _run_ffmpeg_to_tempfile(_RE_ENCODE_VIDEO_CMD(video_path), ".mp4")
     return _serve_tempfile(path, size, "video/mp4", filename)
 
 
-def _ffmpeg_audio_mp3(audio_url, filename):
-    """Convert audio to MP3 and serve it with a known size."""
+def _ffmpeg_audio_mp3(audio_path, filename):
+    """Convert a local audio file to MP3 and serve it with a known size."""
     cmd = [
         "ffmpeg", "-y",
         "-loglevel", "error",
-        "-headers", _FFMPEG_HEADERS,
-        "-i", audio_url,
+        "-i", audio_path,
         "-vn",
         "-c:a", "libmp3lame",
         "-q:a", "2",
@@ -1814,18 +1990,47 @@ def _pick_best_audio(audio_only, combined):
     return None
 
 
-def _handle_quality_download(quality, info, combined, video_only, audio_only):
+def _handle_quality_download(quality, info, combined, video_only, audio_only, youtube_url=None, raw_info=None):
     """
     Build the appropriate ffmpeg response for a given quality string.
+
+    Streams are downloaded via yt-dlp with a *format selector* (so cookies /
+    client / POT context apply and YouTube won't 403), then normalized with
+    ffmpeg into a WhatsApp-compatible MP4 / MP3.
 
     Video qualities : '1080p', '720p', '480p', '360p', '240p', '144p'
     Audio qualities : '128', '48'  (kbps as plain integer strings)
     """
+    import glob as _glob
+    import shutil as _shutil
     title = info.get("title", "video")
     q = quality.strip().lower()
+    webpage = youtube_url or info.get("webpage_url") or (raw_info or {}).get("webpage_url")
+
+    def _cleanup(paths):
+        for p in paths:
+            if not p:
+                continue
+            try:
+                if os.path.isdir(p):
+                    _shutil.rmtree(p, ignore_errors=True)
+                else:
+                    os.unlink(p)
+            except OSError:
+                pass
 
     # ── Audio ────────────────────────────────────────────────
     if q.isdigit():
+        filename = _safe_filename(title, "mp3")
+        if webpage:
+            audio_path = _download_stream_via_ytdl(webpage, "bestaudio/best")
+            if audio_path:
+                try:
+                    return _ffmpeg_audio_mp3(audio_path, filename)
+                finally:
+                    _cleanup([os.path.dirname(audio_path)])
+            return jsonify({"error": "Audio stream could not be downloaded"}), 502
+
         target_abr = int(q)
         if audio_only:
             best = min(audio_only, key=lambda f: abs((f.get("abr") or 0) - target_abr))
@@ -1833,28 +2038,37 @@ def _handle_quality_download(quality, info, combined, video_only, audio_only):
             best = combined[0]
         else:
             return jsonify({"error": "No audio stream found"}), 404
-
-        filename = _safe_filename(title, "mp3")
-        return _ffmpeg_audio_mp3(best["url"], filename)
+        return _ffmpeg_audio_mp3(best.get("url") or "", filename)
 
     # ── Video ────────────────────────────────────────────────
     if q.endswith("p") and q[:-1].isdigit():
         target_h = int(q[:-1])
+        filename = _safe_filename(title, "mp4")
+
+        if webpage:
+            video_path = _download_stream_via_ytdl(
+                webpage,
+                f"bestvideo[height<={target_h}]+bestaudio/best[height<={target_h}]",
+                merge_output_format="mp4",
+            )
+            if video_path:
+                try:
+                    return _ffmpeg_combined_video(video_path, filename)
+                finally:
+                    _cleanup([os.path.dirname(video_path)])
+            return jsonify({"error": f"Could not download video for quality '{quality}'"}), 502
 
         video_fmt = _pick_video_for_quality(target_h, combined, video_only)
         if not video_fmt:
             return jsonify({"error": f"No video stream found for quality '{quality}'"}), 404
 
-        filename = _safe_filename(title, "mp4")
-
         if video_fmt["has_audio"]:
-            return _ffmpeg_combined_video(video_fmt["url"], filename)
+            return _ffmpeg_combined_video(video_fmt.get("url") or "", filename)
 
         audio_fmt = _pick_best_audio(audio_only, combined)
         if not audio_fmt:
-            return _ffmpeg_combined_video(video_fmt["url"], filename)
-
-        return _ffmpeg_merge_video_audio(video_fmt["url"], audio_fmt["url"], filename)
+            return _ffmpeg_combined_video(video_fmt.get("url") or "", filename)
+        return _ffmpeg_merge_video_audio(video_fmt.get("url") or "", audio_fmt.get("url") or "", filename)
 
     return jsonify({"error": f"Unknown quality '{quality}'"}), 400
 
@@ -2028,7 +2242,7 @@ def index():
 
             # With quality → stream/download the file
             if quality:
-                return _handle_quality_download(quality, info, combined, video_only, audio_only)
+                return _handle_quality_download(quality, info, combined, video_only, audio_only, youtube_url=url, raw_info=info)
 
             # Without quality → return APK-compatible JSON
             return _build_apk_response(info, combined, video_only, audio_only, url)
@@ -2068,50 +2282,86 @@ def search():
     if not query:
         return jsonify({"error": "Query is required"}), 400
 
-    def _do_search(cookie_path=None, player_client=None):
+    def _do_search(cookie_path=None, player_client=None, timeout=None):
         opts = get_ydl_opts(cookie_path, player_client)
         opts["extract_flat"] = True
         opts["playlistend"]  = limit
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            return ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
+
+        result = {}
+        timeout = timeout or _EXTRACT_TIMEOUT_SECONDS
+
+        def _run():
+            try:
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    result["info"] = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
+            except Exception as e:
+                result["error"] = e
+
+        thread = threading.Thread(target=_run, daemon=True)
+        thread.start()
+        thread.join(timeout=timeout)
+        if thread.is_alive():
+            raise RuntimeError(f"Search timed out after {timeout}s")
+        if "error" in result:
+            raise result["error"]
+        return result.get("info")
 
     assigned = _cookie_pool.get_next()
     info = None
     last_exc = None
+    clients = ["default"] + [c for c in _FALLBACK_PLAYER_CLIENTS if c != "default"]
+    is_block = False
+    budget_start = time.monotonic()
 
-    # Round 1: assigned cookie
-    try:
-        info = _do_search(assigned)
-        if assigned:
-            print(f"[Search] OK → {os.path.basename(assigned)}")
-    except Exception as e:
-        last_exc = e
-        is_cookie = assigned and _is_cookie_error(e)
-        is_nsig   = _is_nsig_error(e)
-        if is_cookie:
-            _cookie_pool.mark_blocked(assigned)
-        if not (is_cookie or is_nsig):
-            return jsonify({"error": str(e)}), 500
+    def _in_budget():
+        return (time.monotonic() - budget_start) < _EXTRACT_BUDGET_SECONDS
 
-    # Round 2: other cookies (only if cookie error)
-    if info is None and is_cookie:
-        for c in [x for x in _cookie_pool._load_cookies() if x != assigned]:
-            try:
-                info = _do_search(c)
-                print(f"[Search] OK fallback → {os.path.basename(c)}")
-                break
-            except Exception as e:
-                last_exc = e
-                if _is_cookie_error(e):
-                    _cookie_pool.mark_blocked(c)
-
-    # Round 3: mediaconnect without cookie
-    if info is None:
+    def _try_search(cookie_path, client):
+        nonlocal last_exc, is_block
         try:
-            info = _do_search(player_client="mediaconnect")
-            print("[Search] OK → mediaconnect (no cookie)")
+            remaining = max(1, _EXTRACT_BUDGET_SECONDS - (time.monotonic() - budget_start))
+            return _do_search(cookie_path, player_client=client,
+                              timeout=min(_EXTRACT_TIMEOUT_SECONDS, remaining))
         except Exception as e:
             last_exc = e
+            if _is_cookie_error(e) or _is_nsig_error(e):
+                is_block = True
+            return None
+
+    # Round 1: assigned cookie, walk through player clients
+    for client in clients:
+        if not _in_budget():
+            break
+        info = _try_search(assigned, client)
+        if info:
+            if assigned:
+                print(f"[Search] OK → {os.path.basename(assigned)} client={client}")
+            break
+
+    # Round 2: other cookies (only on block error)
+    if info is None and is_block:
+        for c in [x for x in _cookie_pool._load_cookies() if x != assigned]:
+            if not _in_budget():
+                break
+            for client in clients:
+                info = _try_search(c, client)
+                if info:
+                    print(f"[Search] OK fallback → {os.path.basename(c)} client={client}")
+                    break
+            if info:
+                break
+            if is_block:
+                _cookie_pool.mark_blocked(c)
+
+    # Round 3: remaining clients without cookie
+    if info is None and _in_budget():
+        for client in clients:
+            if not _in_budget():
+                break
+            info = _try_search(None, client)
+            if info:
+                print(f"[Search] OK → no-cookie client={client}")
+                break
 
     if info is None:
         return jsonify({"error": str(last_exc)}), 500
@@ -2164,6 +2414,22 @@ def download_audio(link=None):
             "all_audio_formats": audio_only,
         })
     except Exception as e:
+        # ── Backup: try the nexray YouTube API directly ──────────────
+        if _is_youtube_url(url):
+            fallback = _nexray_fallback_info(url)
+            if fallback:
+                return jsonify({
+                    "status":            "ok",
+                    "backup":            True,
+                    "title":             fallback.get("title"),
+                    "thumbnail":         fallback.get("thumbnail"),
+                    "duration":          fallback.get("duration") or "N/A",
+                    "channel":           fallback.get("uploader"),
+                    "best_audio":        None,
+                    "all_audio_formats": [],
+                    "_backup_url":       url,
+                    "note":              "yt-dlp blocked, using nexray backup (audio must go through /api/nexray?quality=128)",
+                })
         return jsonify({"status": "error", "error": str(e)}), 500
 
 
@@ -2208,6 +2474,41 @@ def download_video(link=None):
             "formats_count":  len(combined) + len(video_only) + len(audio_only),
         })
     except Exception as e:
+        # ── Backup: expose a nexray download link when yt-dlp is blocked ──
+        if _is_youtube_url(url):
+            fallback = _nexray_fallback_info(url)
+            if fallback:
+                quality_url = (
+                    f"{request.host_url.rstrip('/')}/api/nexray?url="
+                    f"{urllib.parse.quote(url, safe='')}&quality=720"
+                )
+                return jsonify({
+                    "status":    "ok",
+                    "backup":    True,
+                    "title":     fallback.get("title"),
+                    "thumbnail": fallback.get("thumbnail"),
+                    "duration":  fallback.get("duration") or "N/A",
+                    "channel":   fallback.get("uploader"),
+                    "description": "",
+                    "formats": {
+                        "video_audio": [{
+                            "format_id":      "nexray-720",
+                            "ext":            "mp4",
+                            "height":         720,
+                            "has_audio":      True,
+                            "quality":        "720p",
+                            "format_note":    "Video + Audio (nexray backup)",
+                            "filesize_human": "Unknown",
+                            "download_url":   quality_url,
+                            "url":            quality_url,
+                        }],
+                        "combined":   [],
+                        "video_only": [],
+                        "audio_only": [],
+                    },
+                    "formats_flat": [],
+                    "formats_count": 1,
+                })
         return jsonify({"status": "error", "error": str(e)}), 500
 
 
