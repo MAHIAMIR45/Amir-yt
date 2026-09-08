@@ -71,6 +71,12 @@ _FACEBOOK_BACKUP_API_URL = "https://eliteprotech-apis.zone.id/facebook1"
 _FACEBOOK_BACKUP_API_URL_2 = "https://jerrycoder.oggyapi.workers.dev/down/fb"
 _NEXRAY_YT_API_URL = "https://api.nexray.eu.cc/downloader/v1/ytmp4"
 _NEXRAY_YT_TIMEOUT = 60  # nexray can be slow, allow up to 60 s
+# YouTube backup APIs (work from datacenter IPs where yt-dlp is blocked,
+# same trick the site uses for TikTok/Pinterest/Facebook).
+_YT_BACKUP_API_MP4 = "https://eliteprotech-apis.zone.id/ytmp4"      # combined 360p mp4
+_YT_BACKUP_API_MULTI = "https://jerrycoder.oggyapi.workers.dev/down/youtube"  # multi quality
+_YT_BACKUP_TIMEOUT = 25
+_YTDL_RACE_WINDOW = 12  # how long we wait for yt-dlp before using the backup
 _info_cache = {}
 _info_cache_lock = threading.Lock()
 
@@ -927,6 +933,286 @@ def _nexray_fallback_info(url):
         "duration": result.get("duration"),
         "uploader": result.get("author") or "",
     }
+
+
+# ══════════════════════════════════════════════════════
+#  YOUTUBE BACKUP API (third-party, bypasses Render IP block)
+# ══════════════════════════════════════════════════════
+
+def _fetch_yt_backup_combined(url):
+    """
+    Fetch a COMBINED (video+audio) mp4 via the eliteprotech ytmp4 API.
+    Returns a dict or None:
+      {title, url, size, ext:'mp4', height:360}
+    """
+    try:
+        api_url = f"{_YT_BACKUP_API_MP4}?url={urllib.parse.quote(url, safe='')}"
+        req = urllib.request.Request(
+            api_url,
+            headers={"User-Agent": _USER_AGENT, "Accept": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=_YT_BACKUP_TIMEOUT) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except Exception as exc:
+        print(f"[YT-Backup] combined API error: {exc}")
+        return None
+
+    res = payload.get("result") if isinstance(payload.get("result"), dict) else {}
+    media_url = res.get("url")
+    if payload.get("status") is not True or not media_url:
+        return None
+    return {
+        "title": res.get("title") or "",
+        "url": media_url,
+        "size": res.get("size"),
+        "ext": "mp4",
+        "height": 360,
+    }
+
+
+def _fetch_yt_backup_multi(url):
+    """
+    Fetch multi-quality output (video-only mp4/webm + m4a/opus audio) via the
+    jerrycoder API. Returns dict(meta, medias) or None:
+      meta = {title, thumbnail, duration, channel}
+      medias = [{formatId, label, ext, height, abr, url, vcodec, acodec}, ...]
+    """
+    try:
+        api_url = f"{_YT_BACKUP_API_MULTI}?url={urllib.parse.quote(url, safe='')}"
+        req = urllib.request.Request(
+            api_url,
+            headers={"User-Agent": _USER_AGENT, "Accept": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=_YT_BACKUP_TIMEOUT) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except Exception as exc:
+        print(f"[YT-Backup] multi API error: {exc}")
+        return None
+
+    if payload.get("status") != "success" or not isinstance(payload.get("medias"), list):
+        return None
+
+    medias = []
+    for m in payload["medias"]:
+        if not isinstance(m, dict) or not m.get("url"):
+            continue
+        m_url = m.get("url")
+        label = m.get("label") or m.get("quality") or ""
+        height = m.get("height")
+        ext = (m.get("ext") or "").lower()
+        if not ext and label:
+            em = re.search(r"(mp4|webm|m4a|opus|3gp)", label)
+            ext = em.group(1).lower() if em else ""
+        is_video = "video" in label.lower()
+        is_audio = "audio" in label.lower()
+        # itag 18 / 22 / 37 style = combined, everything else video-only
+        fmt_id = str(m.get("formatId") or "")
+        combined = fmt_id in ("18", "22", "37", "59") or (
+            is_video and not re.match(r"\d{3}", fmt_id or "") is None and fmt_id in ("18", "22", "37", "59")
+        )
+        medias.append({
+            "format_id":   fmt_id,
+            "ext":         ext,
+            "height":      height,
+            "abr":         m.get("bitrate") or _bitrate_from_label(label),
+            "vcodec":      "avc1" if ext == "mp4" and is_video else
+                           ("vp9" if ext == "webm" and is_video else None),
+            "acodec":      "mp4a" if ext.endswith(("m4a", "mp4")) and is_audio else
+                           ("opus" if ext == "opus" else None),
+            "combined":    combined,
+            "title":       payload.get("title") or "",
+            "url":         m_url,
+        })
+    if not medias:
+        return None
+
+    return {
+        "meta": {
+            "title": payload.get("title") or "",
+            "thumbnail": payload.get("thumbnail") or payload.get("thumbnail_url") or "",
+            "duration": payload.get("duration"),
+            "channel": payload.get("channel") or payload.get("author") or "",
+        },
+        "medias": medias,
+    }
+
+
+def _bitrate_from_label(label):
+    m = re.search(r"(\d+)\s*kb/s", label or "")
+    if m:
+        return m.group(1)
+    return None
+
+
+def _backup_dl_path(base_url, media_url):
+    return (
+        f"{base_url}/api/yt-backup-dl?url="
+        f"{urllib.parse.quote(media_url, safe='')}"
+    )
+
+
+def _build_yt_backup_response(url, base_url):
+    """Build the /download/video JSON purely from backup APIs (fast, works on
+    blocked datacenter IPs). Returns a Flask Response or None if all backups fail."""
+    combo = _fetch_yt_backup_combined(url)
+    multi = _fetch_yt_backup_multi(url)
+
+    if not combo and not multi:
+        return None
+
+    meta_title = (combo or {}).get("title") or (multi or {}).get("meta", {}).get("title") or "YouTube video"
+    meta_thumb = (multi or {}).get("meta", {}).get("thumbnail") or ""
+    meta_dur = (multi or {}).get("meta", {}).get("duration")
+    meta_chan = (multi or {}).get("meta", {}).get("channel") or ""
+
+    video_audio = []
+    if combo:
+        dl = _backup_dl_path(base_url, combo["url"])
+        video_audio.append({
+            "format_id":      "bk-360",
+            "ext":            "mp4",
+            "height":         360,
+            "has_audio":      True,
+            "quality":        "360p",
+            "format_note":    "Video + Audio (backup)",
+            "filesize_human": format_filesize(combo.get("size")) or "Unknown",
+            "download_url":   dl,
+            "url":            dl,
+        })
+
+    video_only = []
+    audio_only = []
+    if multi:
+        for m in multi["medias"]:
+            if m.get("ext") == "mp4" and (m.get("vcodec") or "").lower() != "none":
+                m_ext = m.get("ext")
+                height = m.get("height")
+                if not m.get("combined"):
+                    # video-only stream from the backup provider — proxy it
+                    dl = _backup_dl_path(base_url, m["url"])
+                    video_only.append({
+                        "format_id":      f"bk-{m['format_id']}",
+                        "ext":            m_ext,
+                        "height":         height,
+                        "has_audio":      False,
+                        "quality":        f"{height}p" if height else m.get("label"),
+                        "format_note":    "Video only",
+                        "vcodec":         m.get("vcodec"),
+                        "filesize_human": "Unknown",
+                        "download_url":   dl,
+                        "url":            dl,
+                    })
+                else:
+                    dl = _backup_dl_path(base_url, m["url"])
+                    video_audio.append({
+                        "format_id":      f"bk-{m['format_id']}",
+                        "ext":            m_ext,
+                        "height":         height,
+                        "has_audio":      True,
+                        "quality":        f"{height}p" if height else m.get("label"),
+                        "format_note":    "Video + Audio (backup)",
+                        "vcodec":         m.get("vcodec"),
+                        "acodec":         "mp4a",
+                        "filesize_human": "Unknown",
+                        "download_url":   dl,
+                        "url":            dl,
+                    })
+            elif m.get("ext") in ("m4a", "opus") or (m.get("acodec")):
+                dl = _backup_dl_path(base_url, m["url"])
+                audio_only.append({
+                    "format_id":      f"bk-{m['format_id']}",
+                    "ext":            m.get("ext"),
+                    "has_audio":      True,
+                    "quality":        "Audio only",
+                    "format_note":    "Audio only",
+                    "abr":            m.get("abr"),
+                    "acodec":         m.get("acodec"),
+                    "filesize_human": "Unknown",
+                    "download_url":   dl,
+                    "url":            dl,
+                })
+
+    return jsonify({
+        "status":    "ok",
+        "backup":    True,
+        "title":     meta_title,
+        "thumbnail": meta_thumb,
+        "duration":  format_duration(meta_dur),
+        "channel":   meta_chan,
+        "description": "",
+        "formats": {
+            "video_audio": video_audio,
+            "combined":   video_audio,
+            "video_only": video_only,
+            "audio_only": audio_only,
+        },
+        "formats_flat":  video_audio + video_only + audio_only,
+        "formats_count": len(video_audio) + len(video_only) + len(audio_only),
+    })
+
+
+def _build_ytdl_video_response(url, info, base_url):
+    """Build the /download/video JSON from a successful yt-dlp extraction."""
+    combined, video_only, audio_only = parse_formats(info)
+    merged_formats = _build_video_audio_formats(
+        combined,
+        video_only,
+        audio_only,
+        url,
+        base_url,
+    )
+    return jsonify({
+        "status":         "ok",
+        "title":          info.get("title"),
+        "thumbnail":      info.get("thumbnail"),
+        "duration":       format_duration(info.get("duration")),
+        "channel":        info.get("uploader"),
+        "description":    (info.get("description") or "")[:300],
+        "formats": {
+            "video_audio": merged_formats,
+            "combined":   combined,
+            "video_only": video_only,
+            "audio_only": audio_only,
+        },
+        "formats_flat":   combined + video_only + audio_only,
+        "formats_count":  len(combined) + len(video_only) + len(audio_only),
+    })
+
+
+def _youtube_race(url, base_url):
+    """
+    Race yt-dlp (fast on clean IPs like Replit) against the third-party backup
+    API (which works even when YouTube blocks the server IP, like Render).
+    Returns a Flask Response, or None if every source fails.
+    """
+    info_box = {}
+
+    def _run_ytdl():
+        try:
+            info_box["info"] = extract_info(url)
+        except Exception as e:
+            info_box["err"] = e
+
+    t = threading.Thread(target=_run_ytdl, daemon=True)
+    t.start()
+
+    # 1) Short window for yt-dlp to win on clean IPs.
+    t.join(timeout=_YTDL_RACE_WINDOW)
+    if info_box.get("info"):
+        return _build_ytdl_video_response(url, info_box["info"], base_url)
+
+    # 2) Fast backup path — works even when YouTube blocks the server IP.
+    backup = _build_yt_backup_response(url, base_url)
+    if backup is not None:
+        return backup
+
+    # 3) Backup failed too: let yt-dlp finish its full fallback run.
+    t.join(timeout=_MEDIACONNECT_FIRST_TIMEOUT)
+    if info_box.get("info"):
+        return _build_ytdl_video_response(url, info_box["info"], base_url)
+
+    print(f"[YT-Race] all sources failed: {info_box.get('err')}")
+    return None
 
 
 def _proxy_tiktok_media(media_url, filename, content_type, expected_size=None):
@@ -2504,6 +2790,23 @@ def download_video(link=None):
     if is_facebook_url(raw):
         return download_facebook()
     url = normalize_url(raw)
+
+    if _is_youtube_url(url):
+        base_url = request.host_url.rstrip("/")
+        try:
+            result = _youtube_race(url, base_url)
+        except Exception as e:
+            print(f"[download/video] race error: {e}")
+            result = None
+        if result is not None:
+            return result
+        return jsonify({
+            "status": "error",
+            "error": "This YouTube video could not be loaded from any source. "
+                     "Try again in a moment.",
+        }), 502
+
+    # Non-YouTube URL: keep the original yt-dlp path.
     try:
         info = extract_info(url)
         combined, video_only, audio_only = parse_formats(info)
@@ -2514,7 +2817,6 @@ def download_video(link=None):
             url,
             request.host_url.rstrip("/"),
         )
-
         return jsonify({
             "status":         "ok",
             "title":          info.get("title"),
@@ -2532,41 +2834,6 @@ def download_video(link=None):
             "formats_count":  len(combined) + len(video_only) + len(audio_only),
         })
     except Exception as e:
-        # ── Backup: expose a nexray download link when yt-dlp is blocked ──
-        if _is_youtube_url(url):
-            fallback = _nexray_fallback_info(url)
-            if fallback:
-                quality_url = (
-                    f"{request.host_url.rstrip('/')}/api/nexray?url="
-                    f"{urllib.parse.quote(url, safe='')}&quality=720"
-                )
-                return jsonify({
-                    "status":    "ok",
-                    "backup":    True,
-                    "title":     fallback.get("title"),
-                    "thumbnail": fallback.get("thumbnail"),
-                    "duration":  fallback.get("duration") or "N/A",
-                    "channel":   fallback.get("uploader"),
-                    "description": "",
-                    "formats": {
-                        "video_audio": [{
-                            "format_id":      "nexray-720",
-                            "ext":            "mp4",
-                            "height":         720,
-                            "has_audio":      True,
-                            "quality":        "720p",
-                            "format_note":    "Video + Audio (nexray backup)",
-                            "filesize_human": "Unknown",
-                            "download_url":   quality_url,
-                            "url":            quality_url,
-                        }],
-                        "combined":   [],
-                        "video_only": [],
-                        "audio_only": [],
-                    },
-                    "formats_flat": [],
-                    "formats_count": 1,
-                })
         return jsonify({"status": "error", "error": str(e)}), 500
 
 
@@ -2598,6 +2865,63 @@ def nexray_api():
     fallback_info["status"] = "ok"
     fallback_info["backup"] = True
     return jsonify(fallback_info)
+
+
+@app.route("/api/yt-backup-dl")
+def yt_backup_dl():
+    """
+    Stream a googlevideo media URL (obtained from a third-party YouTube backup
+    API) through this server. Direct browser hits to googlevideo links are
+    IP-bound, so we proxy them here instead.
+    """
+    media_url = request.args.get("url", "").strip()
+    if not media_url.startswith("http://") and not media_url.startswith("https://"):
+        return jsonify({"status": "error", "error": "invalid url"}), 400
+
+    req = urllib.request.Request(
+        media_url,
+        headers={"User-Agent": _USER_AGENT, "Referer": "https://www.youtube.com/"},
+    )
+    range_header = request.headers.get("Range")
+    if range_header:
+        req.add_header("Range", range_header)
+
+    try:
+        upstream = urllib.request.urlopen(req, timeout=90)
+    except Exception as exc:
+        print(f"[YT-backup-dl] upstream open failed: {exc}")
+        return jsonify({"status": "error", "error": f"Upstream unavailable: {exc}"}), 502
+
+    def generate():
+        try:
+            while True:
+                chunk = upstream.read(65536)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            upstream.close()
+
+    headers = {
+        "Content-Disposition": 'attachment; filename="youtube-video.mp4"',
+        "Cache-Control": "no-store",
+        "X-Content-Type-Options": "nosniff",
+    }
+    content_length = upstream.headers.get("Content-Length")
+    if content_length:
+        headers["Content-Length"] = content_length
+    content_range = upstream.headers.get("Content-Range")
+    status = 200
+    if range_header and content_range:
+        headers["Content-Range"] = content_range
+        status = getattr(upstream, "status", 206)
+
+    return Response(
+        stream_with_context(generate()),
+        status=status,
+        content_type=upstream.headers.get("Content-Type", "video/mp4"),
+        headers=headers,
+    )
 
 
 @app.route("/download/tiktok")
