@@ -34,10 +34,14 @@ _USER_AGENT = (
 
 # Overall hard cap for a single yt-dlp extraction (seconds).
 # Prevents infinite "loading" on hosting like Replit when YouTube stalls.
-_EXTRACT_TIMEOUT_SECONDS = 20
+_EXTRACT_TIMEOUT_SECONDS = 25
 # Maximum total time spent across ALL fallback attempts for one URL.
-# With 7 clients + up to 5 cookies this bounds worst-case hang (~90s).
-_EXTRACT_BUDGET_SECONDS = 90
+# With 7 clients + up to 5 cookies this bounds worst-case hang (~2.5 min).
+_EXTRACT_BUDGET_SECONDS = 150
+# The FIRST mediaconnect attempt (no cookies) is the best shot on datacenter
+# IPs but can be slow on weak hosts (Render free tier = 0.1 CPU). Give it a
+# long single timeout instead of starving it with the per-attempt default.
+_MEDIACONNECT_FIRST_TIMEOUT = 60
 # Clients tried in order when YouTube blocks the default web client (403 / bot).
 # mediaconnect + tv/android/ios/web_safari dodge the n-challenge most of the time.
 _FALLBACK_PLAYER_CLIENTS = ["mediaconnect", "tv", "android", "ios", "web_safari", "mweb"]
@@ -1415,7 +1419,7 @@ def get_ydl_opts(cookie_path=None, player_client=None):
         "noplaylist":                 True,
         "retries":                    1,
         "fragment_retries":           1,
-        "socket_timeout":              12,
+        "socket_timeout":              25,
         "cachedir":                    False,
         "skip_unavailable_fragments": True,
         "http_headers":               {"User-Agent": _USER_AGENT},
@@ -1590,13 +1594,17 @@ def extract_info(url):
     def _remaining():
         return max(1, _EXTRACT_BUDGET_SECONDS - (time.monotonic() - budget_start))
 
-    def _try(opts):
+    def _try(opts, fallback_timeout=None):
         nonlocal last_exc, is_block
+        timeout = fallback_timeout or _EXTRACT_TIMEOUT_SECONDS
+        timeout = min(timeout, _remaining())
         try:
-            info = _ydl_extract(opts, url, timeout=min(_EXTRACT_TIMEOUT_SECONDS, _remaining()))
+            info = _ydl_extract(opts, url, timeout=timeout)
             return info
         except Exception as e:
             last_exc = e
+            print(f"[YDL] FAIL client={opts.get('extractor_args',{}).get('youtube',{}).get('player_client')} "
+                  f"cookie={bool(opts.get('cookiefile'))}: {str(e)[:200]}")
             if _is_cookie_error(e) or _is_nsig_error(e):
                 is_block = True
             return None
@@ -1604,8 +1612,19 @@ def extract_info(url):
     def _in_budget():
         return (time.monotonic() - budget_start) < _EXTRACT_BUDGET_SECONDS
 
-    # ── Round 1: bypass clients WITHOUT cookies (datacenter-IP friendly) ──
-    for client in bypass:
+    # ── Round 1: mediaconnect WITHOUT cookies — the single best shot for
+    #    datacenter IPs. Give it a LONG timeout: on slow hosts (Render free
+    #    tier) a successful mediaconnect extraction can take 30-60s, and the
+    #    old code starved it by walking every client at 20s each.
+    if _in_budget():
+        info = _try(get_ydl_opts(player_client="mediaconnect"),
+                    fallback_timeout=_MEDIACONNECT_FIRST_TIMEOUT)
+        if info is not None:
+            print("[YDL] OK no-cookie client=mediaconnect (first shot)")
+            return cache_and_return(info)
+
+    # ── Round 2: other bypass clients WITHOUT cookies ──────────────────
+    for client in [c for c in bypass if c != "mediaconnect"]:
         if not _in_budget():
             break
         info = _try(get_ydl_opts(player_client=client))
@@ -1626,7 +1645,7 @@ def extract_info(url):
                 return cache_and_return(info)
         raise last_exc
 
-    # ── Round 2: assigned cookie, walk through all player clients ─────
+    # ── Round 3: assigned cookie, walk through all player clients ─────
     for client in all_clients:
         if not _in_budget():
             break
@@ -1635,7 +1654,7 @@ def extract_info(url):
             print(f"[YDL] OK cookie={os.path.basename(assigned)} client={client}")
             return cache_and_return(info)
 
-    # ── Round 3: other cookies (only after a block error) ──────────────
+    # ── Round 4: other cookies (only after a block error) ──────────────
     if is_block:
         for c in others:
             if not _in_budget():
@@ -1648,7 +1667,7 @@ def extract_info(url):
             if is_block:
                 _cookie_pool.mark_blocked(c)
 
-    # ── Round 4: default web client WITHOUT cookie (last resort) ────────
+    # ── Round 5: default web client WITHOUT cookie (last resort) ────────
     if _in_budget():
         info = _try(get_ydl_opts(player_client="default"))
         if info is not None:
@@ -2345,29 +2364,39 @@ def search():
     def _in_budget():
         return (time.monotonic() - budget_start) < _EXTRACT_BUDGET_SECONDS
 
-    def _try_search(cookie_path, client):
+    def _try_search(cookie_path, client, timeout=None):
         nonlocal last_exc, is_block
         try:
             remaining = max(1, _EXTRACT_BUDGET_SECONDS - (time.monotonic() - budget_start))
             return _do_search(cookie_path, player_client=client,
-                              timeout=min(_EXTRACT_TIMEOUT_SECONDS, remaining))
+                              timeout=min(timeout or _EXTRACT_TIMEOUT_SECONDS, remaining))
         except Exception as e:
             last_exc = e
             if _is_cookie_error(e) or _is_nsig_error(e):
                 is_block = True
             return None
 
-    # Round 1: assigned cookie, walk through player clients
-    for client in clients:
-        if not _in_budget():
-            break
-        info = _try_search(assigned, client)
+    # Round 1: mediaconnect WITHOUT cookies — the best single shot on slow
+    # datacenter hosts (Render free tier). Long timeout so it can finish.
+    if _in_budget():
+        remaining = max(1, _EXTRACT_BUDGET_SECONDS - (time.monotonic() - budget_start))
+        info = _try_search(None, "mediaconnect",
+                           timeout=min(_MEDIACONNECT_FIRST_TIMEOUT, remaining))
         if info:
-            if assigned:
-                print(f"[Search] OK → {os.path.basename(assigned)} client={client}")
-            break
+            print("[Search] OK → no-cookie mediaconnect (first shot)")
 
-    # Round 2: other cookies (only on block error)
+    # Round 2: assigned cookie, walk through player clients
+    if info is None:
+        for client in clients:
+            if not _in_budget():
+                break
+            info = _try_search(assigned, client)
+            if info:
+                if assigned:
+                    print(f"[Search] OK → {os.path.basename(assigned)} client={client}")
+                break
+
+    # Round 3: other cookies (only on block error)
     if info is None and is_block:
         for c in [x for x in _cookie_pool._load_cookies() if x != assigned]:
             if not _in_budget():
@@ -2382,7 +2411,7 @@ def search():
             if is_block:
                 _cookie_pool.mark_blocked(c)
 
-    # Round 3: remaining clients without cookie
+    # Round 4: remaining clients without cookie
     if info is None and _in_budget():
         for client in clients:
             if not _in_budget():
