@@ -1048,8 +1048,8 @@ def _bitrate_from_label(label):
     return None
 
 
-def _backup_dl_path(base_url, media_url):
-    return _token_dl_path(base_url, media_url)
+def _backup_dl_path(base_url, media_url, yurl=None, fid=None, height=None):
+    return _token_dl_path(base_url, media_url, yurl=yurl, fid=fid, height=height)
 
 
 # ── Short-token store for long googlevideo URLs ─────────────────────────
@@ -1062,7 +1062,7 @@ _MEDIA_TOKEN_FILE = "/tmp/yt_media_tokens.json"
 _MEDIA_TOKEN_TTL = 3 * 3600
 
 
-def _register_media_url(media_url):
+def _register_media_url(media_url, yurl=None, fid=None, height=None):
     token = secrets.token_hex(8)
     now = time.time()
     with open(_MEDIA_TOKEN_FILE, "a+") as f:
@@ -1073,7 +1073,13 @@ def _register_media_url(media_url):
                 data = json.load(f)
             except Exception:
                 data = {}
-            data[token] = {"u": media_url, "exp": now + _MEDIA_TOKEN_TTL}
+            data[token] = {
+                "u": media_url,
+                "y": yurl,
+                "fid": fid,
+                "h": height,
+                "exp": now + _MEDIA_TOKEN_TTL,
+            }
             data = {k: v for k, v in data.items() if (v.get("exp") or 0) > now}
             f.seek(0)
             f.truncate()
@@ -1085,7 +1091,7 @@ def _register_media_url(media_url):
     return token
 
 
-def _resolve_media_token(token):
+def _resolve_media_entry(token):
     if not token:
         return None
     with open(_MEDIA_TOKEN_FILE, "a+") as f:
@@ -1096,25 +1102,94 @@ def _resolve_media_token(token):
                 data = json.load(f)
             except Exception:
                 return None
-            entry = data.get(token) or {}
-            if (entry.get("exp") or 0) > time.time():
-                return entry.get("u")
+            entry = data.get(token)
+            if entry and (entry.get("exp") or 0) > time.time():
+                return entry
             return None
         finally:
             fcntl.flock(f, fcntl.LOCK_UN)
 
 
-def _token_dl_path(base_url, media_url):
+def _resolve_media_token(token):
+    entry = _resolve_media_entry(token)
+    return entry.get("u") if entry else None
+
+
+def _refresh_media_url(yurl, kind, fid=None, height=None):
+    """Re-ask the backup API for a fresh googlevideo URL when a signed URL
+    expired / got rejected mid-download. kind: 'video' or 'audio'."""
+    if not yurl:
+        return None
+    multi = _fetch_yt_backup_multi(yurl)
+    if not multi:
+        return None
+    medias = multi.get("medias") or []
+    if kind == "video":
+        cands = [m for m in medias if m.get("height") and not m.get("combined")]
+        for c in cands:
+            if fid and str(c.get("format_id")) == str(fid):
+                return c.get("url")
+        for c in cands:
+            if height and c.get("height") == height:
+                return c.get("url")
+        if cands:
+            return max(cands, key=lambda c: c.get("height") or 0).get("url")
+        return None
+    m4as = [m for m in medias if m.get("ext") == "m4a" and m.get("url")]
+    if m4as:
+        return max(m4as, key=lambda m: m.get("abr") or 0).get("url")
+    opus = [m for m in medias if m.get("ext") == "opus" and m.get("url")]
+    if opus:
+        return max(opus, key=lambda m: m.get("abr") or 0).get("url")
+    return None
+
+
+def _open_media(entry, timeout=120, range_header=None):
+    """Open a tokenized googlevideo URL, transparently refreshing from the
+    backup API if the signed URL is dead (403/404). Returns active fileobj."""
+    if not entry or not entry.get("u"):
+        return None
+    range_h = range_header if range_header else "bytes=0-"
+
+    def _request(url):
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": _USER_AGENT,
+                "Referer": "https://www.youtube.com/",
+                "Range": range_h,
+            },
+        )
+        return urllib.request.urlopen(req, timeout=timeout)
+
+    try:
+        return _request(entry["u"])
+    except urllib.error.HTTPError as exc:
+        if exc.code not in (403, 404) or not entry.get("y"):
+            raise
+        print(f"[YT-token] {entry['u'][:70]}... dead ({exc.code}), refreshing")
+        fresh = _refresh_media_url(
+            entry.get("y"),
+            "audio" if not entry.get("h") else "video",
+            entry.get("fid"),
+            entry.get("h"),
+        )
+        if not fresh or fresh == entry.get("u"):
+            raise
+        return _request(fresh)
+
+
+def _token_dl_path(base_url, media_url, yurl=None, fid=None, height=None):
     """Short URL for the media proxy, safe at any request-line limit."""
-    return f"{base_url}/api/yt-backup-dl?t={_register_media_url(media_url)}"
+    token = _register_media_url(media_url, yurl=yurl, fid=fid, height=height)
+    return f"{base_url}/api/yt-backup-dl?t={token}"
 
 
-def _merge_path(base_url, vurl, aurl):
+def _merge_path(base_url, vurl, aurl, yurl=None, vfid=None, afid=None, vh=None, ah=None):
     """Short URL for the merge route, safe at any request-line limit."""
-    return (
-        f"{base_url}/api/yt-backup-merge?vt={_register_media_url(vurl)}"
-        f"&at={_register_media_url(aurl)}"
-    )
+    vt = _register_media_url(vurl, yurl=yurl, fid=vfid, height=vh)
+    at = _register_media_url(aurl, yurl=yurl, fid=afid, height=ah)
+    return f"{base_url}/api/yt-backup-merge?vt={vt}&at={at}"
 
 
 def _build_yt_backup_response(url, base_url):
@@ -1131,9 +1206,17 @@ def _build_yt_backup_response(url, base_url):
     meta_dur = (multi or {}).get("meta", {}).get("duration")
     meta_chan = (multi or {}).get("meta", {}).get("channel") or ""
 
+    dur_sec = meta_dur if isinstance(meta_dur, (int, float)) and meta_dur > 0 else None
+
+    def _est_human(abr):
+        """Estimate merged/file size from helper bitrate + duration."""
+        if not dur_sec or not abr:
+            return "Unknown"
+        return _bytes_to_human(int(float(abr) * dur_sec / 8))
+
     video_audio = []
     if combo:
-        dl = _backup_dl_path(base_url, combo["url"])
+        dl = _backup_dl_path(base_url, combo["url"], url)
         video_audio.append({
             "format_id":      "bk-360",
             "ext":            "mp4",
@@ -1156,7 +1239,7 @@ def _build_yt_backup_response(url, base_url):
                 height = m.get("height")
                 if not m.get("combined"):
                     # video-only stream from the backup provider — proxy it
-                    dl = _backup_dl_path(base_url, m["url"])
+                    dl = _backup_dl_path(base_url, m["url"], url, m.get("format_id"), height)
                     video_only.append({
                         "format_id":      f"bk-{m['format_id']}",
                         "ext":            m_ext,
@@ -1165,7 +1248,7 @@ def _build_yt_backup_response(url, base_url):
                         "quality":        f"{height}p" if height else m.get("label"),
                         "format_note":    "Video only",
                         "vcodec":         m.get("vcodec"),
-                        "filesize_human": "Unknown",
+                        "filesize_human": _est_human(m.get("abr")),
                         "download_url":   dl,
                         "url":            dl,
                     })
@@ -1173,7 +1256,7 @@ def _build_yt_backup_response(url, base_url):
                     if (height or 360) in va_heights:
                         continue
                     va_heights.add(height or 360)
-                    dl = _backup_dl_path(base_url, m["url"])
+                    dl = _backup_dl_path(base_url, m["url"], url, m.get("format_id"), height)
                     video_audio.append({
                         "format_id":      f"bk-{m['format_id']}",
                         "ext":            m_ext,
@@ -1183,12 +1266,12 @@ def _build_yt_backup_response(url, base_url):
                         "format_note":    "Video + Audio (backup)",
                         "vcodec":         m.get("vcodec"),
                         "acodec":         "mp4a",
-                        "filesize_human": "Unknown",
+                        "filesize_human": _est_human(m.get("abr")),
                         "download_url":   dl,
                         "url":            dl,
                     })
             elif m.get("ext") in ("m4a", "opus") or (m.get("acodec")):
-                dl = _backup_dl_path(base_url, m["url"])
+                dl = _backup_dl_path(base_url, m["url"], url, m.get("format_id"), None)
                 audio_only.append({
                     "format_id":      f"bk-{m['format_id']}",
                     "ext":            m.get("ext"),
@@ -1197,7 +1280,7 @@ def _build_yt_backup_response(url, base_url):
                     "format_note":    "Audio only",
                     "abr":            m.get("abr"),
                     "acodec":         m.get("acodec"),
-                    "filesize_human": "Unknown",
+                    "filesize_human": _est_human(m.get("abr")),
                     "download_url":   dl,
                     "url":            dl,
                 })
@@ -1228,7 +1311,9 @@ def _build_yt_backup_response(url, base_url):
 
         def _make_merged(m, audio, ext, acodec, note):
             merge_url = _merge_path(
-                base_url, m["url"], audio["url"]
+                base_url, m["url"], audio["url"],
+                yurl=url, vfid=m.get("format_id"), afid=audio.get("format_id"),
+                vh=m.get("height"), ah=None,
             )
             h = m.get("height")
             return {
@@ -1240,7 +1325,7 @@ def _build_yt_backup_response(url, base_url):
                 "format_note":    note,
                 "vcodec":         m.get("vcodec"),
                 "acodec":         acodec,
-                "filesize_human": "Unknown",
+                "filesize_human": _est_human((m.get("abr") or 0) + (audio.get("abr") or 0)),
                 "download_url":   merge_url,
                 "url":            merge_url,
             }
@@ -3013,27 +3098,25 @@ def yt_backup_dl():
     ?t=<short token>   short URL form (safe against gunicorn request-line limit)
     ?url=<googlevideo> direct long-URL form (kept for compatibility)
     """
-    media_url = _resolve_media_token(request.args.get("t") or "")
-    if not media_url:
+    token = request.args.get("t") or ""
+    if token:
+        entry = _resolve_media_entry(token)
+        if not entry:
+            return jsonify({"status": "error", "error": "Download link expired — reload the video and try again."}), 400
+    else:
         media_url = request.args.get("url", "").strip()
-    if not media_url.startswith("http://") and not media_url.startswith("https://"):
-        return jsonify({"status": "error", "error": "invalid url"}), 400
-    if not _assert_gv_url(media_url):
-        return jsonify({"status": "error", "error": "url must be a googlevideo media link"}), 400
+        if not media_url.startswith("http://") and not media_url.startswith("https://"):
+            return jsonify({"status": "error", "error": "invalid url"}), 400
+        if not _assert_gv_url(media_url):
+            return jsonify({"status": "error", "error": "url must be a googlevideo media link"}), 400
+        entry = {"u": media_url}
 
-    req = urllib.request.Request(
-        media_url,
-        headers={"User-Agent": _USER_AGENT, "Referer": "https://www.youtube.com/"},
-    )
     range_header = request.headers.get("Range")
-    if range_header:
-        req.add_header("Range", range_header)
-
     try:
-        upstream = urllib.request.urlopen(req, timeout=90)
+        upstream = _open_media(entry, timeout=90, range_header=range_header)
     except Exception as exc:
         print(f"[YT-backup-dl] upstream open failed: {exc}")
-        return jsonify({"status": "error", "error": f"Upstream unavailable: {exc}"}), 502
+        return jsonify({"status": "error", "error": "Download failed — please try another quality or reload."}), 502
 
     def generate():
         try:
@@ -3078,19 +3161,12 @@ def _assert_gv_url(candidate):
     )
 
 
-def _download_to_temp(url, dest_dir, prefix, max_bytes=800 * 1024 * 1024):
-    """Stream a URL into a temp file. Returns the file path."""
-    req = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": _USER_AGENT,
-            "Referer": "https://www.youtube.com/",
-            "Range": "bytes=0-",  # googlevideo streams 404 on full GETs without Range
-        },
-    )
+def _download_to_temp(entry, dest_dir, prefix, max_bytes=800 * 1024 * 1024):
+    """Stream a (tokenized) googlevideo URL into a temp file with auto-refresh.
+    Returns the file path."""
     path = os.path.join(dest_dir, f"{prefix}_{os.getpid()}_{int(time.time())}")
     wrote = 0
-    with urllib.request.urlopen(req, timeout=120) as src, open(path, "wb") as out:
+    with _open_media(entry, timeout=120) as src, open(path, "wb") as out:
         while True:
             chunk = src.read(65536)
             if not chunk:
@@ -3129,43 +3205,71 @@ def yt_backup_merge():
     ?vt=<token>&at=<token>              short-token form (recommended)
     ?vurl=<googlevideo>&aurl=<gvideo>   direct long-URL form (compat)
     """
-    vurl = aurl = None
+    ventry = aentry = None
+    yurl = None
     vt = request.args.get("vt", "")
     at = request.args.get("at", "")
     if vt and at:
-        vurl = _resolve_media_token(vt)
-        aurl = _resolve_media_token(at)
-        if not vurl or not aurl:
+        ventry = _resolve_media_entry(vt)
+        aentry = _resolve_media_entry(at)
+        if not ventry or not aentry:
             return jsonify({
                 "status": "error",
-                "error": "link expired, reload the video and try again",
+                "error": "Download link expired — reload the video and try again.",
             }), 400
     else:
         vurl = request.args.get("vurl", "").strip()
         aurl = request.args.get("aurl", "").strip()
-    if not vurl or not aurl:
+        if vurl and aurl and _assert_gv_url(vurl) and _assert_gv_url(aurl):
+            ventry = {"u": vurl}
+            aentry = {"u": aurl}
+    if not ventry or not aentry:
         return jsonify({"status": "error", "error": "vt/at or vurl/aurl required"}), 400
-    if not _assert_gv_url(vurl) or not _assert_gv_url(aurl):
+    if not _assert_gv_url(ventry.get("u") or "") or not _assert_gv_url(aentry.get("u") or ""):
         return jsonify({"status": "error", "error": "invalid media url"}), 400
+    yurl = ventry.get("y") or aentry.get("y")
 
-    tmpdir = tempfile.mkdtemp(prefix="ytmerge_")
-    out_path = os.path.join(tmpdir, "merged.mp4")
+    def _do_merge():
+        tmpdir = tempfile.mkdtemp(prefix="ytmerge_")
+        out_path = os.path.join(tmpdir, "merged.mp4")
+        try:
+            vfile = _download_to_temp(ventry, tmpdir, "v")
+            afile = _download_to_temp(aentry, tmpdir, "a")
+            # -c copy remuxes h264/aac into mp4 without re-encoding (fast even on
+            # Render's 0.1 CPU); faststart makes the file streamable while loading.
+            vcodec_arg = ["-c:v", "copy", "-c:a", "copy"]
+            _run_ffmpeg(
+                ["-y", "-i", vfile, "-i", afile]
+                + vcodec_arg
+                + ["-movflags", "+faststart", out_path]
+            )
+            size = os.path.getsize(out_path)
+        except Exception:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            raise
+        return tmpdir, out_path, size
+
     try:
-        vfile = _download_to_temp(vurl, tmpdir, "v")
-        afile = _download_to_temp(aurl, tmpdir, "a")
-        # -c copy remuxes h264/aac into mp4 without re-encoding (fast even on
-        # Render's 0.1 CPU); faststart makes the file streamable while loading.
-        vcodec_arg = ["-c:v", "copy", "-c:a", "copy"]
-        _run_ffmpeg(
-            ["-y", "-i", vfile, "-i", afile]
-            + vcodec_arg
-            + ["-movflags", "+faststart", out_path]
-        )
-        size = os.path.getsize(out_path)
+        tmpdir, out_path, size = _do_merge()
     except Exception as exc:
-        print(f"[YT-backup-merge] failed: {exc}")
-        shutil.rmtree(tmpdir, ignore_errors=True)
-        return jsonify({"status": "error", "error": f"Merge failed: {exc}"}), 502
+        print(f"[YT-backup-merge] attempt 1 failed: {exc}")
+        try:
+            tmpdir, out_path, size = _do_merge()
+        except Exception as exc2:
+            print(f"[YT-backup-merge] attempt 2 failed: {exc2}")
+            # Last resort: serve the guaranteed combined 360p from the backup.
+            if yurl:
+                try:
+                    combo = _fetch_yt_backup_combined(yurl)
+                    if combo and combo.get("url"):
+                        base = request.host_url.rstrip("/")
+                        return redirect(_backup_dl_path(base, combo["url"], yurl))
+                except Exception:
+                    pass
+            return jsonify({
+                "status": "error",
+                "error": "Download failed — please try another quality or reload.",
+            }), 502
 
     def generate():
         try:

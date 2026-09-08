@@ -1084,8 +1084,9 @@ function testApi(type){
 // ── DOWNLOAD BUTTON FEEDBACK ────────────────────────────
 // Real download links start preparing on the server (ffmpeg merge /
 // nexray backup), which always has a delay. Show an immediate spinner so
-// the user knows the button was clicked.
-document.addEventListener('click',function(e){
+// the user knows the button was clicked. Errors are shown as an alert instead
+// of being saved as a stray .json file.
+document.addEventListener('click', async function(e){
   const a=e.target.closest&&e.target.closest('a.dl-btn,a.dl-btn-a');
   if(!a||!a.hasAttribute('download')||!a.getAttribute('href'))return;
   if(a.classList.contains('dl-loading'))return;
@@ -1095,18 +1096,36 @@ document.addEventListener('click',function(e){
   a.classList.add('dl-loading');
   a.innerHTML='<span class="dl-spinner"></span> Preparing…';
 
-  setTimeout(function(){
+  try{
+    const resp=await fetch(a.href,{credentials:'include',headers:{'Accept':'*/*'}});
+    if(!resp.ok){
+      let msg='Download failed. Please try another quality or reload the video.';
+      try{const j=await resp.json(); if(j&&j.error)msg=j.error;}catch(_){}
+      alert(msg);
+      return;
+    }
+    const ct=resp.headers.get('Content-Type')||'';
+    if(ct.indexOf('json')>=0){
+      let msg='Download failed. Please try another quality or reload.';
+      try{const j=await resp.json(); if(j&&j.error)msg=j.error;}catch(_){}
+      alert(msg);
+      return;
+    }
+    const blob=await resp.blob();
+    const urlBlob=URL.createObjectURL(blob);
     const t=document.createElement('a');
-    t.href=a.href;
-    t.download=a.getAttribute('download')||'';
+    t.href=urlBlob;
+    t.download=a.getAttribute('download')||'youtube-video.mp4';
     document.body.appendChild(t);
     t.click();
     t.remove();
-    setTimeout(function(){
-      a.classList.remove('dl-loading');
-      a.innerHTML=original;
-    },15000);
-  },60);
+    setTimeout(function(){URL.revokeObjectURL(urlBlob);},4000);
+  }catch(err){
+    alert('Download failed — please try again.');
+  }finally{
+    a.classList.remove('dl-loading');
+    a.innerHTML=original;
+  }
 });
 </script>
 </body>
