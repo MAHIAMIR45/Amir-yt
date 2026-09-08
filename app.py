@@ -12,6 +12,8 @@ import datetime
 import functools
 import tempfile
 import shutil
+import secrets
+import fcntl
 import yt_dlp
 from flask import Flask, request, jsonify, make_response, render_template, Response, stream_with_context, redirect, url_for, session, abort
 from flask_cors import CORS
@@ -1047,9 +1049,71 @@ def _bitrate_from_label(label):
 
 
 def _backup_dl_path(base_url, media_url):
+    return _token_dl_path(base_url, media_url)
+
+
+# ── Short-token store for long googlevideo URLs ─────────────────────────
+# googlevideo signed URLs can be >4KB, which blows past gunicorn's default
+# request-line limit (4096) if two are embedded in one query string. Instead we
+# register each URL under a short random token on a shared JSON file. Render
+# runs both workers in the same container, so the file is shared; flock makes
+# writes atomic across processes.
+_MEDIA_TOKEN_FILE = "/tmp/yt_media_tokens.json"
+_MEDIA_TOKEN_TTL = 3 * 3600
+
+
+def _register_media_url(media_url):
+    token = secrets.token_hex(8)
+    now = time.time()
+    with open(_MEDIA_TOKEN_FILE, "a+") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            f.seek(0)
+            try:
+                data = json.load(f)
+            except Exception:
+                data = {}
+            data[token] = {"u": media_url, "exp": now + _MEDIA_TOKEN_TTL}
+            data = {k: v for k, v in data.items() if (v.get("exp") or 0) > now}
+            f.seek(0)
+            f.truncate()
+            json.dump(data, f)
+            f.flush()
+            os.fsync(f.fileno())
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+    return token
+
+
+def _resolve_media_token(token):
+    if not token:
+        return None
+    with open(_MEDIA_TOKEN_FILE, "a+") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            f.seek(0)
+            try:
+                data = json.load(f)
+            except Exception:
+                return None
+            entry = data.get(token) or {}
+            if (entry.get("exp") or 0) > time.time():
+                return entry.get("u")
+            return None
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def _token_dl_path(base_url, media_url):
+    """Short URL for the media proxy, safe at any request-line limit."""
+    return f"{base_url}/api/yt-backup-dl?t={_register_media_url(media_url)}"
+
+
+def _merge_path(base_url, vurl, aurl):
+    """Short URL for the merge route, safe at any request-line limit."""
     return (
-        f"{base_url}/api/yt-backup-dl?url="
-        f"{urllib.parse.quote(media_url, safe='')}"
+        f"{base_url}/api/yt-backup-merge?vt={_register_media_url(vurl)}"
+        f"&at={_register_media_url(aurl)}"
     )
 
 
@@ -1163,10 +1227,8 @@ def _build_yt_backup_response(url, base_url):
         ]
 
         def _make_merged(m, audio, ext, acodec, note):
-            merge_url = (
-                f"{base_url}/api/yt-backup-merge?vurl="
-                f"{urllib.parse.quote(m['url'], safe='')}&aurl="
-                f"{urllib.parse.quote(audio['url'], safe='')}"
+            merge_url = _merge_path(
+                base_url, m["url"], audio["url"]
             )
             h = m.get("height")
             return {
@@ -2947,10 +3009,17 @@ def yt_backup_dl():
     Stream a googlevideo media URL (obtained from a third-party YouTube backup
     API) through this server. Direct browser hits to googlevideo links are
     IP-bound, so we proxy them here instead.
+
+    ?t=<short token>   short URL form (safe against gunicorn request-line limit)
+    ?url=<googlevideo> direct long-URL form (kept for compatibility)
     """
-    media_url = request.args.get("url", "").strip()
+    media_url = _resolve_media_token(request.args.get("t") or "")
+    if not media_url:
+        media_url = request.args.get("url", "").strip()
     if not media_url.startswith("http://") and not media_url.startswith("https://"):
         return jsonify({"status": "error", "error": "invalid url"}), 400
+    if not _assert_gv_url(media_url):
+        return jsonify({"status": "error", "error": "url must be a googlevideo media link"}), 400
 
     req = urllib.request.Request(
         media_url,
@@ -3057,12 +3126,25 @@ def yt_backup_merge():
     single MP4 using ffmpeg -c copy (fast remux). This is how we offer every
     quality WITH audio even though YouTube's DASH streams are split.
 
-    ?vurl=<video-only googlevideo url>&aurl=<audio googlevideo url>
+    ?vt=<token>&at=<token>              short-token form (recommended)
+    ?vurl=<googlevideo>&aurl=<gvideo>   direct long-URL form (compat)
     """
-    vurl = request.args.get("vurl", "").strip()
-    aurl = request.args.get("aurl", "").strip()
+    vurl = aurl = None
+    vt = request.args.get("vt", "")
+    at = request.args.get("at", "")
+    if vt and at:
+        vurl = _resolve_media_token(vt)
+        aurl = _resolve_media_token(at)
+        if not vurl or not aurl:
+            return jsonify({
+                "status": "error",
+                "error": "link expired, reload the video and try again",
+            }), 400
+    else:
+        vurl = request.args.get("vurl", "").strip()
+        aurl = request.args.get("aurl", "").strip()
     if not vurl or not aurl:
-        return jsonify({"status": "error", "error": "vurl and aurl required"}), 400
+        return jsonify({"status": "error", "error": "vt/at or vurl/aurl required"}), 400
     if not _assert_gv_url(vurl) or not _assert_gv_url(aurl):
         return jsonify({"status": "error", "error": "invalid media url"}), 400
 
