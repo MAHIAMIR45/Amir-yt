@@ -10,6 +10,8 @@ import urllib.error
 import socket
 import datetime
 import functools
+import tempfile
+import shutil
 import yt_dlp
 from flask import Flask, request, jsonify, make_response, render_template, Response, stream_with_context, redirect, url_for, session, abort
 from flask_cors import CORS
@@ -1082,6 +1084,7 @@ def _build_yt_backup_response(url, base_url):
 
     video_only = []
     audio_only = []
+    va_heights = {f.get("height") for f in video_audio if f.get("height")}
     if multi:
         for m in multi["medias"]:
             if m.get("ext") == "mp4" and (m.get("vcodec") or "").lower() != "none":
@@ -1103,6 +1106,9 @@ def _build_yt_backup_response(url, base_url):
                         "url":            dl,
                     })
                 else:
+                    if (height or 360) in va_heights:
+                        continue
+                    va_heights.add(height or 360)
                     dl = _backup_dl_path(base_url, m["url"])
                     video_audio.append({
                         "format_id":      f"bk-{m['format_id']}",
@@ -1131,6 +1137,74 @@ def _build_yt_backup_response(url, base_url):
                     "download_url":   dl,
                     "url":            dl,
                 })
+
+    # ── Merged "every quality + audio" entries (ffmpeg -c copy remux) ────
+    # YouTube's DASH splits video and audio, so the backup APIs only hand us
+    # combined 360p. To offer EVERY quality WITH audio we remux the best video
+    # stream + best audio stream into a single mp4. -c copy is a fast remux
+    # (no re-encode) so it works even on Render's 0.1 CPU.
+    if multi:
+        best_m4a = best_opus = None
+        m4a_abr = opus_abr = 0
+        for m in multi["medias"]:
+            if not m.get("url"):
+                continue
+            if m.get("ext") == "m4a" and (m.get("abr") or 0) >= m4a_abr:
+                best_m4a, m4a_abr = m, m.get("abr") or 0
+            elif m.get("ext") == "opus" and (m.get("abr") or 0) >= opus_abr:
+                best_opus, opus_abr = m, m.get("abr") or 0
+
+        va_heights = {f.get("height") for f in video_audio}
+        # Video-only streams: anything with a height that isn't a combined itag
+        # (jerrycoder doesn't label streams 'video'/'audio', so use height).
+        vmedia = [
+            m for m in multi["medias"]
+            if m.get("url") and m.get("height") and not m.get("combined")
+        ]
+
+        def _make_merged(m, audio, ext, acodec, note):
+            merge_url = (
+                f"{base_url}/api/yt-backup-merge?vurl="
+                f"{urllib.parse.quote(m['url'], safe='')}&aurl="
+                f"{urllib.parse.quote(audio['url'], safe='')}"
+            )
+            h = m.get("height")
+            return {
+                "format_id":      f"bk-{m['format_id']}+merge",
+                "ext":            ext,
+                "height":         h,
+                "has_audio":      True,
+                "quality":        f"{h}p",
+                "format_note":    note,
+                "vcodec":         m.get("vcodec"),
+                "acodec":         acodec,
+                "filesize_human": "Unknown",
+                "download_url":   merge_url,
+                "url":            merge_url,
+            }
+
+        mp4_v = sorted([m for m in vmedia if m.get("ext") == "mp4"],
+                       key=lambda x: -(x.get("height") or 0))
+        for m in mp4_v:
+            h = m.get("height")
+            if not h or h in va_heights or not best_m4a:
+                continue
+            video_audio.append(_make_merged(m, best_m4a, "mp4", "mp4a",
+                                            "Video + Audio (merged)"))
+            va_heights.add(h)
+
+        webm_v = sorted([m for m in vmedia if m.get("ext") == "webm"],
+                        key=lambda x: -(x.get("height") or 0))
+        for m in webm_v:
+            h = m.get("height")
+            if not h or h in va_heights or not best_opus:
+                continue
+            video_audio.append(_make_merged(m, best_opus, "webm", "opus",
+                                            "Video + Audio (merged)"))
+            va_heights.add(h)
+
+    # Show qualities highest → lowest like the yt-dlp path does.
+    video_audio.sort(key=lambda f: -(f.get("height") or 0))
 
     return jsonify({
         "status":    "ok",
@@ -2921,6 +2995,116 @@ def yt_backup_dl():
         status=status,
         content_type=upstream.headers.get("Content-Type", "video/mp4"),
         headers=headers,
+    )
+
+
+def _assert_gv_url(candidate):
+    """Only allow googlevideo hosts (avoid SSRF via pass-through proxy/merge)."""
+    parsed = urllib.parse.urlparse(candidate)
+    host = (parsed.hostname or "").lower()
+    return (
+        parsed.scheme in ("http", "https")
+        and host
+        and host.endswith("googlevideo.com")
+    )
+
+
+def _download_to_temp(url, dest_dir, prefix, max_bytes=800 * 1024 * 1024):
+    """Stream a URL into a temp file. Returns the file path."""
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": _USER_AGENT,
+            "Referer": "https://www.youtube.com/",
+            "Range": "bytes=0-",  # googlevideo streams 404 on full GETs without Range
+        },
+    )
+    path = os.path.join(dest_dir, f"{prefix}_{os.getpid()}_{int(time.time())}")
+    wrote = 0
+    with urllib.request.urlopen(req, timeout=120) as src, open(path, "wb") as out:
+        while True:
+            chunk = src.read(65536)
+            if not chunk:
+                break
+            wrote += len(chunk)
+            if wrote > max_bytes:
+                out.close()
+                os.remove(path)
+                raise RuntimeError("Stream too large to merge")
+            out.write(chunk)
+    return path
+
+
+def _run_ffmpeg(args, timeout=240):
+    import shutil
+    ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
+    proc = subprocess.run(
+        [ffmpeg] + args,
+        capture_output=True,
+        timeout=timeout,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"ffmpeg failed ({proc.returncode}): "
+            f"{proc.stderr.decode('utf-8', 'ignore')[-300:]}"
+        )
+
+
+@app.route("/api/yt-backup-merge")
+def yt_backup_merge():
+    """
+    Merge a video-only stream + audio stream (both from the backup APIs) into a
+    single MP4 using ffmpeg -c copy (fast remux). This is how we offer every
+    quality WITH audio even though YouTube's DASH streams are split.
+
+    ?vurl=<video-only googlevideo url>&aurl=<audio googlevideo url>
+    """
+    vurl = request.args.get("vurl", "").strip()
+    aurl = request.args.get("aurl", "").strip()
+    if not vurl or not aurl:
+        return jsonify({"status": "error", "error": "vurl and aurl required"}), 400
+    if not _assert_gv_url(vurl) or not _assert_gv_url(aurl):
+        return jsonify({"status": "error", "error": "invalid media url"}), 400
+
+    tmpdir = tempfile.mkdtemp(prefix="ytmerge_")
+    out_path = os.path.join(tmpdir, "merged.mp4")
+    try:
+        vfile = _download_to_temp(vurl, tmpdir, "v")
+        afile = _download_to_temp(aurl, tmpdir, "a")
+        # -c copy remuxes h264/aac into mp4 without re-encoding (fast even on
+        # Render's 0.1 CPU); faststart makes the file streamable while loading.
+        vcodec_arg = ["-c:v", "copy", "-c:a", "copy"]
+        _run_ffmpeg(
+            ["-y", "-i", vfile, "-i", afile]
+            + vcodec_arg
+            + ["-movflags", "+faststart", out_path]
+        )
+        size = os.path.getsize(out_path)
+    except Exception as exc:
+        print(f"[YT-backup-merge] failed: {exc}")
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        return jsonify({"status": "error", "error": f"Merge failed: {exc}"}), 502
+
+    def generate():
+        try:
+            with open(out_path, "rb") as f:
+                while True:
+                    chunk = f.read(65536)
+                    if not chunk:
+                        break
+                    yield chunk
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    return Response(
+        stream_with_context(generate()),
+        content_type="video/mp4",
+        headers={
+            "Content-Length": str(size),
+            "Content-Disposition": 'attachment; filename="youtube-video.mp4"',
+            "Cache-Control": "no-store",
+        },
+        direct_passthrough=False,
     )
 
 
