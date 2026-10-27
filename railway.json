@@ -2,5 +2,8 @@
   "$schema": "https://railway.com/railway.schema.json",
   "build": {
     "buildCommand": "pip install -r requirements.txt"
+  },
+  "deploy": {
+    "startCommand": "gunicorn app:app --bind 0.0.0.0:$PORT --timeout 300 --workers 2 --limit-request-line 21000 --limit-request-field_size 21000"
   }
 }
