@@ -2403,6 +2403,7 @@ def _RE_ENCODE_VIDEO_CMD(video_path):
         "-map", "0:v:0",
         "-map", "0:a:0?",
         "-c:v", "libx264",
+        "-profile:v", "high",
         "-preset", "veryfast",
         "-crf", "23",
         "-pix_fmt", "yuv420p",
@@ -2425,6 +2426,7 @@ def _ffmpeg_merge_video_audio(video_path, audio_path, filename):
         "-map", "0:v:0",
         "-map", "1:a:0",
         "-c:v", "libx264",
+        "-profile:v", "high",
         "-preset", "veryfast",
         "-crf", "23",
         "-pix_fmt", "yuv420p",
@@ -2439,22 +2441,45 @@ def _ffmpeg_merge_video_audio(video_path, audio_path, filename):
     return _serve_tempfile(path, size, "video/mp4", filename)
 
 
-def _ffmpeg_combined_video(video_path, filename):
-    """Fast-remux a combined stream to a WhatsApp-compatible MP4 (fallback: re-encode)."""
-    remux = [
-        "ffmpeg", "-y",
-        "-loglevel", "error",
-        "-i", video_path,
-        "-map", "0:v:0",
-        "-map", "0:a:0?",
-        "-c", "copy",
-        "-movflags", "+faststart",
-        "-f", "mp4",
-    ]
+def _is_whatsapp_safe(path):
+    """True if the file is already H.264 (yuv420p, even size) + AAC (or no audio)."""
     try:
-        path, size = _run_ffmpeg_to_tempfile(remux, ".mp4")
+        r = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-i", path],
+            capture_output=True, timeout=60,
+        )
+        info = r.stderr.decode("utf-8", errors="replace")
     except Exception:
-        path, size = _run_ffmpeg_to_tempfile(_RE_ENCODE_VIDEO_CMD(video_path), ".mp4")
+        return False
+    vm = re.search(r"Video: h264[^\n]*?, yuv420p[^\n]*?, (\d+)x(\d+)", info)
+    if not vm:
+        return False
+    if int(vm.group(1)) % 2 or int(vm.group(2)) % 2:
+        return False
+    if "Audio:" in info and not re.search(r"Audio: aac", info):
+        return False
+    return True
+
+
+def _ffmpeg_combined_video(video_path, filename):
+    """Serve a WhatsApp/Facebook-safe MP4: remux only if already H.264+AAC, else re-encode."""
+    if _is_whatsapp_safe(video_path):
+        remux = [
+            "ffmpeg", "-y",
+            "-loglevel", "error",
+            "-i", video_path,
+            "-map", "0:v:0",
+            "-map", "0:a:0?",
+            "-c", "copy",
+            "-movflags", "+faststart",
+            "-f", "mp4",
+        ]
+        try:
+            path, size = _run_ffmpeg_to_tempfile(remux, ".mp4")
+            return _serve_tempfile(path, size, "video/mp4", filename)
+        except Exception:
+            pass
+    path, size = _run_ffmpeg_to_tempfile(_RE_ENCODE_VIDEO_CMD(video_path), ".mp4")
     return _serve_tempfile(path, size, "video/mp4", filename)
 
 
@@ -2576,6 +2601,7 @@ def _handle_quality_download(quality, info, combined, video_only, audio_only, yo
         if webpage:
             video_path = _download_stream_via_ytdl(
                 webpage,
+                f"bestvideo[height<={target_h}][vcodec^=avc1]+bestaudio[ext=m4a]/"
                 f"bestvideo[height<={target_h}]+bestaudio/best[height<={target_h}]",
                 merge_output_format="mp4",
             )
@@ -3239,11 +3265,14 @@ def yt_backup_merge():
             afile = _download_to_temp(aentry, tmpdir, "a")
             # -c copy remuxes h264/aac into mp4 without re-encoding (fast even on
             # Render's 0.1 CPU); faststart makes the file streamable while loading.
-            vcodec_arg = ["-c:v", "copy", "-c:a", "copy"]
             _run_ffmpeg(
-                ["-y", "-i", vfile, "-i", afile]
-                + vcodec_arg
-                + ["-movflags", "+faststart", out_path]
+                ["-y", "-i", vfile, "-i", afile,
+                 "-map", "0:v:0", "-map", "1:a:0",
+                 "-c:v", "libx264", "-profile:v", "high", "-preset", "veryfast",
+                 "-crf", "23", "-pix_fmt", "yuv420p",
+                 "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2,setsar=1",
+                 "-c:a", "aac", "-b:a", "128k", "-ar", "48000",
+                 "-movflags", "+faststart", out_path]
             )
             size = os.path.getsize(out_path)
         except Exception:
