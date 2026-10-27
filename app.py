@@ -25,6 +25,8 @@ except Exception:
     pass
 
 app = Flask(__name__)
+from werkzeug.middleware.proxy_fix import ProxyFix
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 CORS(app)
 app.secret_key = os.environ.get("ADMIN_SECRET_KEY", "amir-admin-panel-secret-2026")
 
